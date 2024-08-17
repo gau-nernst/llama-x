@@ -2,6 +2,9 @@
 # https://github.com/pytorch/torchtune
 # https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 
+from typing import NamedTuple
+
+import safetensors.torch
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -9,24 +12,35 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 
+class Llama3_1Config(NamedTuple):
+    embed_dim: int
+    num_layers: int
+    head_dim: int
+    num_heads: int
+    num_kv_heads: int
+    intermediate_dim: int
+    max_seq_len: int = 2048
+    vocab_size: int = 128256
+    attn_dropout: float = 0.0
+    rope_base: int = 50_000
+    activation_checkpointing: bool = False
+
+
 class Llama3ScaledRoPE(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        max_seq_len: int = 4096,
-        base: int = 10_000,
-    ) -> None:
+    def __init__(self, config: Llama3_1Config) -> None:
         super().__init__()
-        self.dim = dim
-        self.base = base
-        self.max_seq_len = max_seq_len
+        self.head_dim = config.head_dim
+        self.rope_base = config.rope_base
+        self.max_seq_len = config.max_seq_len
         self.is_cache_built = False
 
     def reset_parameters(self):
         self._rope_init()
 
     def _rope_init(self):
-        freqs = 1.0 / (self.base ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim))
+        freqs = 1.0 / (
+            self.rope_base ** (torch.arange(0, self.head_dim, 2)[: (self.head_dim // 2)].float() / self.head_dim)
+        )
         theta = self.apply_scaling(freqs)
         self.register_buffer("theta", theta, persistent=False)
         self.build_rope_cache(self.max_seq_len)
@@ -81,30 +95,19 @@ class Llama3ScaledRoPE(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        max_seq_len: int = 4096,
-        attn_dropout: float = 0.0,
-    ) -> None:
+    def __init__(self, config: Llama3_1Config) -> None:
         super().__init__()
-        assert num_heads % num_kv_heads == 0
-        assert embed_dim % num_heads == 0
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.embed_dim = embed_dim
-        self.attn_dropout = attn_dropout
-        self.head_dim = head_dim
-        self.max_seq_len = max_seq_len
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.embed_dim = config.embed_dim
+        self.attn_dropout = config.attn_dropout
+        self.head_dim = config.head_dim
 
-        self.wq = nn.Linear(embed_dim, num_heads * head_dim, bias=False)
-        self.wk = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
-        self.wv = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
-        self.wo = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=500_000)
+        self.wq = nn.Linear(self.embed_dim, self.num_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.rope = Llama3ScaledRoPE(config)
         self.kv_cache = None
 
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
@@ -135,11 +138,11 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(self, config: Llama3_1Config):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w1 = nn.Linear(config.embed_dim, config.intermediate_dim, bias=False)
+        self.w3 = nn.Linear(config.embed_dim, config.intermediate_dim, bias=False)
+        self.w2 = nn.Linear(config.intermediate_dim, config.embed_dim, bias=False)
         self.act = nn.SiLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -147,21 +150,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        max_seq_len: int,
-        intermediate_dim: int,
-        attn_dropout: float = 0.0,
-    ) -> None:
+    def __init__(self, config: Llama3_1Config) -> None:
         super().__init__()
-        head_dim = embed_dim // num_heads
-        self.attention_norm = nn.RMSNorm(embed_dim, eps=1e-5)
-        self.attention = Attention(embed_dim, num_heads, num_kv_heads, head_dim, max_seq_len, attn_dropout)
-        self.ffn_norm = nn.RMSNorm(embed_dim, eps=1e-5)
-        self.feed_forward = FeedForward(embed_dim, intermediate_dim)
+        self.attention_norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
+        self.attention = Attention(config)
+        self.ffn_norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
+        self.feed_forward = FeedForward(config)
 
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
         x = x + self.attention(self.attention_norm(x), mask=mask, input_pos=input_pos)
@@ -170,29 +164,13 @@ class TransformerLayer(nn.Module):
 
 
 class Llama3_1(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_layers: int,
-        num_heads: int,
-        num_kv_heads: int,
-        intermediate_dim: int,
-        max_seq_len: int = 2048,
-        vocab_size: int = 128256,
-        attn_dropout: float = 0.0,
-        activation_checkpointing: bool = False,
-    ) -> None:
+    def __init__(self, config: Llama3_1Config) -> None:
         super().__init__()
-        self.tok_embeddings = nn.Embedding(vocab_size, embed_dim)
-        self.layers = nn.ModuleList(
-            [
-                TransformerLayer(embed_dim, num_heads, num_kv_heads, max_seq_len, intermediate_dim, attn_dropout)
-                for _ in range(num_layers)
-            ]
-        )
-        self.norm = nn.RMSNorm(embed_dim, eps=1e-5)
-        self.output = nn.Linear(embed_dim, vocab_size, bias=False)
-        self.activation_checkpointing = activation_checkpointing
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.layers = nn.ModuleList([TransformerLayer(config) for _ in range(config.num_layers)])
+        self.norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
+        self.output = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
+        self.activation_checkpointing = config.activation_checkpointing
 
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
         x = self.tok_embeddings(x)
@@ -206,18 +184,50 @@ class Llama3_1(nn.Module):
         return x
 
 
-def llama3_1_8b(**kwargs):
+def _build_model(model_id: str, filenames: list[str], **kwargs):
+    config = Llama3_1Config(**kwargs)
     with torch.device("meta"):
-        model = Llama3_1(
-            embed_dim=4096,
-            num_layers=32,
-            num_heads=32,
-            num_kv_heads=8,
-            intermediate_dim=14_336,
-            **kwargs,
-        )
+        model = Llama3_1(config).eval()
 
-    state_dict_path = hf_hub_download("meta-llama/Meta-Llama-3.1-8B-Instruct", "original/consolidated.00.pth")
-    state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=True, mmap=True)
+    state_dict = dict()
+    for filename in filenames:
+        filepath = hf_hub_download(model_id, filename)
+
+        if filepath.endswith(".safetensors"):
+            this_state_dict = safetensors.torch.load_file(filepath)
+        else:
+            this_state_dict = torch.load(filepath, map_location="cpu", weights_only=True, mmap=True)
+
+        for k in this_state_dict.keys():
+            state_dict[k] = this_state_dict[k]
+
     model.load_state_dict(state_dict, assign=True)
     return model
+
+
+def llama3_1_8b(**kwargs):
+    return _build_model(
+        "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        ["original/consolidated.00.pth"],
+        embed_dim=4096,
+        head_dim=128,
+        num_layers=32,
+        num_heads=32,
+        num_kv_heads=8,
+        intermediate_dim=14_336,
+        **kwargs,
+    )
+
+
+def llama3_1_4b(**kwargs):
+    return _build_model(
+        "nvidia/Llama-3.1-Minitron-4B-Width-Base",
+        ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        embed_dim=3072,
+        head_dim=128,
+        num_layers=32,
+        num_heads=32,
+        num_kv_heads=8,
+        intermediate_dim=9216,
+        **kwargs,
+    )
