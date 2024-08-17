@@ -1,9 +1,12 @@
-# code in this file has been adapted from https://github.com/pytorch/torchtune
+# code in this file has been adapted from
+# https://github.com/pytorch/torchtune
+# https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 class Llama3ScaledRoPE(nn.Module):
@@ -77,7 +80,7 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-class CausalSelfAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -101,62 +104,49 @@ class CausalSelfAttention(nn.Module):
         self.wk = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
         self.wv = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.pos_embeddings = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=500_000)
+        self.rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=500_000)
         self.kv_cache = None
 
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
         B, L, _ = x.shape
-        q = self.wq(x)  # (B, L, num_heads * head_dim)
-        k = self.wk(x)  # (B, L, num_kv_heads * head_dim)
-        v = self.wv(x)  # (B, L, num_kv_heads * head_dim)
 
-        if self.num_heads != self.num_kv_heads:
-            q_per_kv = self.num_heads // self.num_kv_heads
-            k = k.unflatten(2, (self.num_kv_heads, 1, self.head_dim)).repeat(1, 1, 1, q_per_kv, 1)
-            v = v.unflatten(2, (self.num_kv_heads, 1, self.head_dim)).repeat(1, 1, 1, q_per_kv, 1)
+        q = self.wq(x).view(B, L, self.num_heads, self.head_dim)
+        k = self.wk(x).view(B, L, self.num_kv_heads, self.head_dim)
+        v = self.wv(x).view(B, L, self.num_kv_heads, self.head_dim)
 
-        q = q.view(B, L, self.num_heads, self.head_dim)
-        k = k.view(B, L, self.num_heads, self.head_dim)
-        v = v.view(B, L, self.num_heads, self.head_dim)
-
-        q = self.pos_embeddings(q, input_pos=input_pos)
-        k = self.pos_embeddings(k, input_pos=input_pos)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        q = self.rope(q).transpose(1, 2)
+        k = self.rope(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
+        q_per_kv = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(q_per_kv, dim=1)
+        v = v.repeat_interleave(q_per_kv, dim=1)
+
         if mask is not None:
             mask = mask[:, None, :, :]
 
-        output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            dropout_p=self.attn_dropout,
-            is_causal=self.kv_cache is None and mask is None,
-        )
-        output = output.transpose(1, 2).contiguous().view(B, L, -1)
-        return self.wo(output)
+        is_causal = self.kv_cache is None and mask is None
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.attn_dropout, is_causal=is_causal)
+        out = out.transpose(1, 2).reshape(B, L, self.embed_dim)
+        return self.wo(out)
 
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.act = nn.SiLU()
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(self.act(self.w1(x)) * self.w3(x))
 
 
-class TransformerDecoderLayer(nn.Module):
+class TransformerLayer(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -169,7 +159,7 @@ class TransformerDecoderLayer(nn.Module):
         super().__init__()
         head_dim = embed_dim // num_heads
         self.attention_norm = nn.RMSNorm(embed_dim, eps=1e-5)
-        self.attention = CausalSelfAttention(embed_dim, num_heads, num_kv_heads, head_dim, max_seq_len, attn_dropout)
+        self.attention = Attention(embed_dim, num_heads, num_kv_heads, head_dim, max_seq_len, attn_dropout)
         self.ffn_norm = nn.RMSNorm(embed_dim, eps=1e-5)
         self.feed_forward = FeedForward(embed_dim, intermediate_dim)
 
@@ -190,22 +180,27 @@ class Llama3_1(nn.Module):
         max_seq_len: int = 2048,
         vocab_size: int = 128256,
         attn_dropout: float = 0.0,
+        activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.tok_embeddings = nn.Embedding(vocab_size, embed_dim)
         self.layers = nn.ModuleList(
             [
-                TransformerDecoderLayer(embed_dim, num_heads, num_kv_heads, max_seq_len, intermediate_dim, attn_dropout)
+                TransformerLayer(embed_dim, num_heads, num_kv_heads, max_seq_len, intermediate_dim, attn_dropout)
                 for _ in range(num_layers)
             ]
         )
         self.norm = nn.RMSNorm(embed_dim, eps=1e-5)
         self.output = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.activation_checkpointing = activation_checkpointing
 
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
         x = self.tok_embeddings(x)
         for layer in self.layers:
-            x = layer(x, mask=mask, input_pos=input_pos)
+            if self.activation_checkpointing:
+                x = checkpoint(layer, x, mask=mask, input_pos=input_pos)
+            else:
+                x = layer(x, mask=mask, input_pos=input_pos)
         x = self.norm(x)
         x = self.output(x)
         return x
@@ -221,7 +216,6 @@ def llama3_1_8b(**kwargs):
             intermediate_dim=14_336,
             **kwargs,
         )
-    model.bfloat16()
 
     state_dict_path = hf_hub_download("meta-llama/Meta-Llama-3.1-8B-Instruct", "original/consolidated.00.pth")
     state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=True, mmap=True)
