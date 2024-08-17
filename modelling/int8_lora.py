@@ -24,7 +24,7 @@ class Int8LoRALinear(nn.Module):
     def forward(self, x: Tensor):
         out = _Int8WeightOnlyLinear.apply(x, self.weight_i8, self.weight_scale)
         if self.rank > 0:
-            out = out + x @ self.lora_a.T @ self.lora_b.T * (self.rank / self.alpha)
+            out = out + x @ self.lora_a.T @ self.lora_b.T * (self.alpha / self.rank)
         return out
 
     @staticmethod
