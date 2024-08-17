@@ -4,7 +4,7 @@
 
 from typing import NamedTuple
 
-import safetensors.torch
+import safetensors
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -106,7 +106,7 @@ class Attention(nn.Module):
         self.wq = nn.Linear(self.embed_dim, self.num_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.wo = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=False)
         self.rope = Llama3ScaledRoPE(config)
         self.kv_cache = None
 
@@ -184,6 +184,23 @@ class Llama3_1(nn.Module):
         return x
 
 
+def _rename_hf_key(key: str):
+    return (
+        key.removeprefix("model.")
+        .replace("embed_tokens", "tok_embeddings")
+        .replace("self_attn.q_proj", "attention.wq")
+        .replace("self_attn.k_proj", "attention.wk")
+        .replace("self_attn.v_proj", "attention.wv")
+        .replace("self_attn.o_proj", "attention.wo")
+        .replace("mlp.gate_proj", "feed_forward.w1")
+        .replace("mlp.up_proj", "feed_forward.w3")
+        .replace("mlp.down_proj", "feed_forward.w2")
+        .replace("input_layernorm", "attention_norm")
+        .replace("post_attention_layernorm", "ffn_norm")
+        .replace("lm_head", "output")
+    )
+
+
 def _build_model(model_id: str, filenames: list[str], **kwargs):
     config = Llama3_1Config(**kwargs)
     with torch.device("meta"):
@@ -194,12 +211,13 @@ def _build_model(model_id: str, filenames: list[str], **kwargs):
         filepath = hf_hub_download(model_id, filename)
 
         if filepath.endswith(".safetensors"):
-            this_state_dict = safetensors.torch.load_file(filepath)
+            with safetensors.safe_open(filepath, framework="pt") as f:
+                for k in f.keys():
+                    state_dict[_rename_hf_key(k)] = f.get_tensor(k)
+
         else:
             this_state_dict = torch.load(filepath, map_location="cpu", weights_only=True, mmap=True)
-
-        for k in this_state_dict.keys():
-            state_dict[k] = this_state_dict[k]
+            state_dict.update(this_state_dict)
 
     model.load_state_dict(state_dict, assign=True)
     return model
