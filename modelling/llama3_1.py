@@ -132,7 +132,7 @@ class Attention(nn.Module):
 
         is_causal = self.kv_cache is None and mask is None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.attn_dropout, is_causal=is_causal)
-        out = out.transpose(1, 2).reshape(B, L, self.embed_dim)
+        out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
         return self.wo(out)
 
 
