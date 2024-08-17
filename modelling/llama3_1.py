@@ -5,9 +5,11 @@
 from typing import NamedTuple
 
 import safetensors
+import tiktoken
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+from tiktoken.load import load_tiktoken_bpe
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
@@ -74,10 +76,7 @@ class Llama3ScaledRoPE(nn.Module):
         return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
     def forward(self, x: Tensor, *, input_pos: Tensor | None = None) -> Tensor:
-        if not self.is_cache_built:
-            with torch.device(x.device):
-                self._rope_init()
-
+        assert self.is_cache_built
         seq_len = x.size(1)
         rope_cache = self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
         xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
@@ -172,6 +171,13 @@ class Llama3_1(nn.Module):
         self.output = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.activation_checkpointing = config.activation_checkpointing
 
+        # TODO: single RoPE shared across all layers
+
+    def build_cache(self):
+        for m in self.modules():
+            if isinstance(m, Llama3ScaledRoPE):
+                m._rope_init()
+
     def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
         x = self.tok_embeddings(x)
         for layer in self.layers:
@@ -219,7 +225,9 @@ def _build_model(model_id: str, filenames: list[str], **kwargs):
             this_state_dict = torch.load(filepath, map_location="cpu", weights_only=True, mmap=True)
             state_dict.update(this_state_dict)
 
+    # we cannot build cache under meta device context. thus, build cache after loading weights
     model.load_state_dict(state_dict, assign=True)
+    model.build_cache()
     return model
 
 
@@ -249,3 +257,29 @@ def llama3_1_4b(**kwargs):
         intermediate_dim=9216,
         **kwargs,
     )
+
+
+# https://github.com/pytorch/torchtune/blob/main/torchtune/models/llama3/_tokenizer.py
+class Llama3Tokenizer:
+    def __init__(self):
+        tokenizer_path = hf_hub_download("meta-llama/Meta-Llama-3.1-8B-Instruct", "original/tokenizer.model")
+        pat_str = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+        tokenizer = tiktoken.Encoding(
+            "llama3",
+            pat_str=pat_str,
+            mergeable_ranks=load_tiktoken_bpe(tokenizer_path),
+            special_tokens=dict(),
+        )
+        # TODO: special tokens
+        self.tokenizer = tokenizer
+        self.bos_id = 128000
+        self.eos_id = 128001
+
+    def __call__(self, text: str, add_bos: bool = False, add_eos: bool = False):
+        tokens = []
+        if add_bos:
+            tokens.append(self.bos_id)
+        tokens.extend(self.tokenizer.encode(text))
+        if add_eos:
+            tokens.append(self.eos_id)
+        return tokens

@@ -10,8 +10,8 @@ class Int8LoRALinear(nn.Module):
         self.alpha = alpha
 
         weight_i8, weight_scale = _quantize_int8(linear.weight.detach())
-        self.register_buffer("weight_i8", weight_i8)
-        self.register_buffer("weight_scale", weight_scale)
+        self.register_buffer("weight_i8", weight_i8, persistent=False)
+        self.register_buffer("weight_scale", weight_scale, persistent=False)
 
         if rank > 0:
             dtype = linear.weight.dtype
