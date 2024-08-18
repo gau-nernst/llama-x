@@ -36,12 +36,12 @@ class Int8LoRALinear(nn.Module):
         return model
 
 
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 def _quantize_int8(x: Tensor):
     dtype = x.dtype
     x = x.float()
     scale = x.abs().amax(1) / 127
-    x = x / scale.view(-1, 1)
+    x = x / scale.clip(1e-12).view(-1, 1)
     x = x.round().to(torch.int8)
     return x, scale.to(dtype)
 

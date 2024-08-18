@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from tiktoken.load import load_tiktoken_bpe
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -28,69 +29,47 @@ class Llama3_1Config(NamedTuple):
     activation_checkpointing: bool = False
 
 
-class Llama3ScaledRoPE(nn.Module):
-    def __init__(self, config: Llama3_1Config) -> None:
-        super().__init__()
-        self.head_dim = config.head_dim
-        self.rope_base = config.rope_base
-        self.max_seq_len = config.max_seq_len
-        self.is_cache_built = False
+def scale_llama3_1_rope(freqs: torch.Tensor):
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 8192
 
-    def reset_parameters(self):
-        self._rope_init()
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * torch.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-    def _rope_init(self):
-        freqs = 1.0 / (
-            self.rope_base ** (torch.arange(0, self.head_dim, 2)[: (self.head_dim // 2)].float() / self.head_dim)
-        )
-        theta = self.apply_scaling(freqs)
-        self.register_buffer("theta", theta, persistent=False)
-        self.build_rope_cache(self.max_seq_len)
-        self.is_cache_built = True
 
-    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
-        seq_idx = torch.arange(max_seq_len, dtype=self.theta.dtype, device=self.theta.device)
-        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float()
-        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
-        self.register_buffer("cache", cache, persistent=False)
+def build_llama3_1_rope(config: Llama3_1Config):
+    freqs = 1.0 / (config.rope_base ** (torch.arange(0, config.head_dim, 2, dtype=torch.float32) / config.head_dim))
+    theta = scale_llama3_1_rope(freqs)
+    seq_idx = torch.arange(config.max_seq_len, dtype=torch.float32)
+    idx_theta = torch.einsum("i, j -> ij", seq_idx, theta)
+    return torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
 
-    def apply_scaling(self, freqs: torch.Tensor):
-        scale_factor = 8
-        low_freq_factor = 1
-        high_freq_factor = 4
-        old_context_len = 8192
 
-        low_freq_wavelen = old_context_len / low_freq_factor
-        high_freq_wavelen = old_context_len / high_freq_factor
-        new_freqs = []
-        for freq in freqs:
-            wavelen = 2 * torch.pi / freq
-            if wavelen < high_freq_wavelen:
-                new_freqs.append(freq)
-            elif wavelen > low_freq_wavelen:
-                new_freqs.append(freq / scale_factor)
-            else:
-                assert low_freq_wavelen != high_freq_wavelen
-                smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-                new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-        return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
-
-    def forward(self, x: Tensor, *, input_pos: Tensor | None = None) -> Tensor:
-        assert self.is_cache_built
-        seq_len = x.size(1)
-        rope_cache = self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
-        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
-
-        x_out = torch.stack(
-            [
-                xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
-                xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
-            ],
-            -1,
-        )
-        x_out = x_out.flatten(3)
-        return x_out.type_as(x)
+def apply_rope(x: Tensor, rope: Tensor) -> Tensor:
+    rope = rope.view(1, x.shape[1], 1, -1, 2)
+    out = x.float().unflatten(-1, (-1, 2))
+    out = torch.stack(
+        [
+            out[..., 0] * rope[..., 0] - out[..., 1] * rope[..., 1],
+            out[..., 1] * rope[..., 0] + out[..., 0] * rope[..., 1],
+        ],
+        -1,
+    )
+    return out.flatten(3).type_as(x)
 
 
 class Attention(nn.Module):
@@ -106,32 +85,38 @@ class Attention(nn.Module):
         self.wk = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=False)
-        self.rope = Llama3ScaledRoPE(config)
         self.kv_cache = None
 
-    def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        rope: Tensor,
+        *,
+        mask: Tensor | None = None,
+        input_pos: Tensor | None = None,
+        block_mask: Tensor | None = None,
+    ) -> Tensor:
         B, L, _ = x.shape
-
         q = self.wq(x).view(B, L, self.num_heads, self.head_dim)
         k = self.wk(x).view(B, L, self.num_kv_heads, self.head_dim)
         v = self.wv(x).view(B, L, self.num_kv_heads, self.head_dim)
 
-        q = self.rope(q).transpose(1, 2)
-        k = self.rope(k).transpose(1, 2)
+        q = apply_rope(q, rope).transpose(1, 2)
+        k = apply_rope(k, rope).transpose(1, 2)
         v = v.transpose(1, 2)
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        q_per_kv = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(q_per_kv, dim=1)
-        v = v.repeat_interleave(q_per_kv, dim=1)
+        if block_mask is not None:
+            out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
 
-        if mask is not None:
-            mask = mask[:, None, :, :]
+        else:
+            if mask is not None:
+                mask = mask[:, None, :, :]
+            is_causal = self.kv_cache is None and mask is None
+            out = F.scaled_dot_product_attention(q, k, v, mask, self.attn_dropout, is_causal, enable_gqa=True)
 
-        is_causal = self.kv_cache is None and mask is None
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.attn_dropout, is_causal=is_causal)
         out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
         return self.wo(out)
 
@@ -156,8 +141,16 @@ class TransformerLayer(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
         self.feed_forward = FeedForward(config)
 
-    def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
-        x = x + self.attention(self.attention_norm(x), mask=mask, input_pos=input_pos)
+    def forward(
+        self,
+        x: Tensor,
+        rope: Tensor,
+        *,
+        mask: Tensor | None = None,
+        input_pos: Tensor | None = None,
+        block_mask: Tensor | None = None,
+    ) -> Tensor:
+        x = x + self.attention(self.attention_norm(x), rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
 
@@ -169,22 +162,38 @@ class Llama3_1(nn.Module):
         self.layers = nn.ModuleList([TransformerLayer(config) for _ in range(config.num_layers)])
         self.norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
         self.output = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
-        self.activation_checkpointing = config.activation_checkpointing
-
-        # TODO: single RoPE shared across all layers
+        self.config = config
 
     def build_cache(self):
-        for m in self.modules():
-            if isinstance(m, Llama3ScaledRoPE):
-                m._rope_init()
+        self.register_buffer("rope", build_llama3_1_rope(self.config), persistent=False)
 
-    def forward(self, x: Tensor, *, mask: Tensor | None = None, input_pos: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        *,
+        mask: Tensor | None = None,
+        input_pos: Tensor | None = None,
+        prefix_length: Tensor | None = None,
+    ) -> Tensor:
+        if prefix_length is not None:
+            assert mask is None and input_pos is None
+
+            def prefix_mask(b, h, q_idx, kv_idx):
+                return (kv_idx <= prefix_length[b]) | (q_idx >= kv_idx)
+
+            B, L = x.shape
+            block_mask = create_block_mask(prefix_mask, B, None, L, L)
+
+        else:
+            block_mask = None
+
         x = self.tok_embeddings(x)
+        rope = self.rope[: x.shape[1]]
         for layer in self.layers:
-            if self.activation_checkpointing:
-                x = checkpoint(layer, x, mask=mask, input_pos=input_pos)
+            if self.config.activation_checkpointing:
+                x = checkpoint(layer, x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
             else:
-                x = layer(x, mask=mask, input_pos=input_pos)
+                x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
         x = self.norm(x)
         x = self.output(x)
         return x
@@ -270,7 +279,6 @@ class Llama3Tokenizer:
             mergeable_ranks=load_tiktoken_bpe(tokenizer_path),
             special_tokens=dict(),
         )
-        # TODO: special tokens
         self.tokenizer = tokenizer
         self.bos_id = 128000
         self.eos_id = 128001
