@@ -109,7 +109,9 @@ class Attention(nn.Module):
             k, v = self.kv_cache.update(input_pos, k, v)
 
         if block_mask is not None:
-            out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            out = flex_attention(q, k, v, block_mask=block_mask)
 
         else:
             if mask is not None:
@@ -167,23 +169,25 @@ class Llama3_1(nn.Module):
     def build_cache(self):
         self.register_buffer("rope", build_llama3_1_rope(self.config), persistent=False)
 
+    @torch._dynamo.disable
+    def build_block_mask(self, x: Tensor, prefix_lengths: Tensor):
+        def prefix_mask(b, h, q_idx, kv_idx):
+            return (kv_idx <= prefix_lengths[b]) | (q_idx >= kv_idx)
+
+        B, L = x.shape
+        return create_block_mask(prefix_mask, B, self.config.num_heads, L, L)
+
     def forward(
         self,
         x: Tensor,
         *,
         mask: Tensor | None = None,
         input_pos: Tensor | None = None,
-        prefix_length: Tensor | None = None,
+        prefix_lengths: Tensor | None = None,
     ) -> Tensor:
-        if prefix_length is not None:
+        if prefix_lengths is not None:
             assert mask is None and input_pos is None
-
-            def prefix_mask(b, h, q_idx, kv_idx):
-                return (kv_idx <= prefix_length[b]) | (q_idx >= kv_idx)
-
-            B, L = x.shape
-            block_mask = create_block_mask(prefix_mask, B, None, L, L)
-
+            block_mask = self.build_block_mask(x, prefix_lengths)
         else:
             block_mask = None
 
@@ -191,7 +195,9 @@ class Llama3_1(nn.Module):
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:
             if self.config.activation_checkpointing:
-                x = checkpoint(layer, x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
+                x = checkpoint(
+                    layer, x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask, use_reentrant=False
+                )
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
         x = self.norm(x)

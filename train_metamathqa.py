@@ -20,15 +20,18 @@ from modelling import Int8LoRALinear, Llama3Tokenizer
 from train_utils import get_grad_norm, print_model_stats
 
 
-def _data_iter(tokens_list: list[Tensor], batch_size: int, seq_len_multiple: int = 256):
+def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_size: int, seq_len_multiple: int = 256):
     n = len(tokens_list)
 
     while True:
         # shuffle
-        tokens_list = [tokens_list[idx] for idx in torch.randperm(n)]
+        indices = torch.randperm(n)
+        tokens_list = [tokens_list[idx] for idx in indices]
+        prefix_length_list = prefix_length_list[indices]
 
         for i in range(0, n - batch_size + 1, batch_size):
             tokens_batch = tokens_list[i : i + batch_size]
+            prefix_length_batch = prefix_length_list[i : i + batch_size]
             max_length = max(math.ceil(x.shape[0] / seq_len_multiple) * seq_len_multiple for x in tokens_batch)
 
             inputs = torch.zeros(batch_size, max_length, dtype=torch.int64)
@@ -40,28 +43,34 @@ def _data_iter(tokens_list: list[Tensor], batch_size: int, seq_len_multiple: int
                 labels[_i, :n_toks] = tokens
                 lengths[_i] = n_toks
 
-            yield inputs.cuda(), labels.cuda(), lengths
+            yield inputs.cuda(), labels.cuda(), lengths, prefix_length_batch.cuda()
 
 
 def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 256):
     tokenizer = Llama3Tokenizer()
 
     def apply_template(example):
-        text = (
+        prompt = (
             "Below is an instruction that describes a task. "
             "Write a response that appropriately completes the request.\n\n"
             "### Instruction:\n{query}\n\n"
-            "### Response: Let's think step by step. {response}"
-        ).format(query=example["query"], response=example["response"])
-        return dict(input_ids=tokenizer(text, add_bos=True, add_eos=True)[:max_seq_len])
+            "### Response: Let's think step by step."
+        ).format(query=example["query"])
+        answer = " {response}".format(response=example["response"])
+        prompt_tokens = tokenizer(prompt, add_bos=True)
+        answer_tokens = tokenizer(answer, add_eos=True)
+        return dict(
+            input_ids=(prompt_tokens + answer_tokens)[:max_seq_len],
+            prefix_length=len(prompt_tokens),
+        )
 
     ds = load_dataset("meta-math/MetaMathQA", split="train").with_format("torch")
-    tokens_list = ds.map(apply_template, remove_columns=ds.features)["input_ids"]
-    return _data_iter(tokens_list, batch_size, seq_len_multiple), len(ds)
+    ds = ds.map(apply_template, remove_columns=ds.features)
+    return _data_iter(ds["input_ids"], ds["prefix_length"], batch_size, seq_len_multiple), len(ds)
 
 
-def get_loss(model, inputs, labels):
-    logits = model(inputs)[:, :-1].flatten(0, 1)
+def get_loss(model: modelling.Llama3_1, inputs: Tensor, labels: Tensor, prefix_lengths: Tensor | None = None):
+    logits = model(inputs, prefix_lengths=prefix_lengths)[:, :-1].flatten(0, 1)
     labels = labels[:, 1:].flatten()
     return F.cross_entropy(logits, labels)
 
@@ -69,6 +78,7 @@ def get_loss(model, inputs, labels):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="llama3_1_4b")
+    parser.add_argument("--prefix_lm", action="store_true")
     parser.add_argument("--freeze_embedding_layer", action="store_true")
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
@@ -126,9 +136,9 @@ if __name__ == "__main__":
     time0 = time.perf_counter()
 
     while step < args.n_steps:
-        inputs, labels, lengths = next(train_data_iter)
-        loss_fn = torch.compile(get_loss, fullgraph=True) if args.compile else get_loss
-        loss = loss_fn(model, inputs, labels)
+        inputs, labels, lengths, prefix_lengths = next(train_data_iter)
+        loss_fn = torch.compile(get_loss) if args.compile else get_loss
+        loss = loss_fn(model, inputs, labels, prefix_lengths if args.prefix_lm else None)
         loss.backward()
         n_toks += lengths.sum()
 
