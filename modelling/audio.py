@@ -44,6 +44,7 @@ class Llama3_1Audio(Llama3_1):
     ) -> Tensor:
         # we need to slice the last time step to make it a nice multiple
         audio = self.melspec(audio)[..., :-1].clip(1e-12).log()  # (B, n_mels, L)
+        # TODO: replace this with batch norm?
         audio = audio - audio.mean(2, keepdim=True)  # cmn
         audio = audio.to(dtype=self.audio_embed[0].weight.dtype)
         audio = self.audio_embed(audio).transpose(1, 2)
@@ -57,6 +58,8 @@ class Llama3_1Audio(Llama3_1):
                 x = checkpoint(layer, x, rope, mask=mask, input_pos=input_pos, use_reentrant=False)
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos)
+
+        x = x[:, audio.shape[1] :]  # remove audio embs
         x = self.norm(x)
         x = self.output(x)
         return x

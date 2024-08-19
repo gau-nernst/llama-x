@@ -24,15 +24,20 @@ from train_utils import get_grad_norm, print_model_stats
 
 
 class LibriSpeech(IterableDataset):
-    def __init__(self, data_dir: str, batch_size: int, seq_len: int, audio_config: AudioConfig = AudioConfig()):
+    def __init__(
+        self,
+        data_dir: str,
+        audio_duration: float,
+        seq_len_multiple: int,
+        batch_size: int,
+        audio_config: AudioConfig = AudioConfig(),
+    ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
-        self.seq_len = seq_len
+        self.audio_duration = audio_duration
+        self.seq_len_multiple = seq_len_multiple
         self.batch_size = batch_size
         self.audio_config = audio_config
-
-        # since we have stride-2 conv after mel-spec, times 2 the hop_length
-        self.audio_stride = self.audio_config.hop_length * 2
 
         tokenizer = Llama3Tokenizer()
         self.samples = []
@@ -46,27 +51,20 @@ class LibriSpeech(IterableDataset):
 
         self.samples.sort()
 
-    @staticmethod
-    def _pad_to_multiple(x: Tensor, n: int):
-        pad = math.ceil(x.shape[0] / n) * n - x.shape[0]
-        return F.pad(x, (0, pad))
-
     def _prepare_batch(self, batch: list[tuple[Tensor, Tensor]]):
         audio_batch, _tokens_batch = zip(*batch)
 
-        max_audio_length = max(x.shape[0] for x in audio_batch)
-        n = self.audio_stride * 256
-        max_audio_length = math.ceil(max_audio_length // n) * n
-        audio_batch = [F.pad(x, (0, max_audio_length - x.shape[0])) for x in audio_batch]
+        audio_length = int(self.audio_duration * self.audio_config.sample_rate)
+        audio_batch = [F.pad(x, (0, audio_length - x.shape[0])) for x in audio_batch]
         audio_batch = torch.stack(audio_batch, dim=0)
-        num_audio_tokens = max_audio_length // self.audio_stride
 
+        tokens_length = math.ceil(max(len(x) for x in _tokens_batch) / self.seq_len_multiple) * self.seq_len_multiple
         tokens_batch = []
         labels_batch = []
         for tokens in _tokens_batch:
-            pad = self.seq_len - (num_audio_tokens + len(tokens))
+            pad = tokens_length - len(tokens)
             tokens_batch.append(tokens + [Llama3Tokenizer.pad_id] * pad)
-            labels_batch.append([-100] * num_audio_tokens + tokens[1:] + [-100] * (pad + 1))
+            labels_batch.append(tokens[1:] + [-100] * (pad + 1))
 
         tokens_batch = torch.tensor(tokens_batch)
         labels_batch = torch.tensor(labels_batch)
@@ -77,7 +75,7 @@ class LibriSpeech(IterableDataset):
         batch = []
         audio = []
         tokens = [Llama3Tokenizer.bos_id]
-        length = 1
+        duration = 0
 
         while True:
             # NOTE: we don't partition the data. just shuffle it with different seeds across workers
@@ -88,9 +86,8 @@ class LibriSpeech(IterableDataset):
                 assert fs == self.audio_config.sample_rate
                 this_audio = this_audio.mean(0)
 
-                # this is an over-estimate
-                this_length = math.ceil(this_audio.shape[0] / self.audio_stride) + len(this_tokens)
-                if length + this_length + 1 > self.seq_len:
+                this_duration = this_audio.shape[0] / fs
+                if duration + this_duration > self.audio_duration:
                     audio = torch.cat(audio, dim=0)
                     tokens.append(Llama3Tokenizer.eos_id)
 
@@ -101,11 +98,11 @@ class LibriSpeech(IterableDataset):
 
                     audio = []
                     tokens = [Llama3Tokenizer.bos_id]
-                    length = 1
+                    duration = 0
 
                 audio.append(this_audio)
                 tokens.extend(this_tokens)
-                length += this_length
+                duration += this_duration
 
 
 def get_loss(model: modelling.Llama3_1, audio: Tensor, tokens: Tensor, labels: Tensor):
@@ -120,7 +117,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile", action="store_true")
 
     parser.add_argument("--dataset_dir", required=True)
-    parser.add_argument("--max_seq_len", type=int, default=2048)
+    parser.add_argument("--audio_duration", type=float, default=40)
+    parser.add_argument("--seq_len_multiple", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--n_workers", type=int, default=4)
@@ -138,7 +136,7 @@ if __name__ == "__main__":
         torch.manual_seed(args.seed)
 
     model: modelling.Llama3_1Audio = getattr(modelling, args.model)(
-        max_seq_len=args.max_seq_len,
+        max_seq_len=4096,
         activation_checkpointing=args.activation_checkpointing,
     )
     if args.freeze_embedding_layer:
@@ -152,7 +150,7 @@ if __name__ == "__main__":
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
 
-    ds = LibriSpeech(args.dataset_dir, args.batch_size, args.max_seq_len, model.audio_config)
+    ds = LibriSpeech(args.dataset_dir, args.audio_duration, args.seq_len_multiple, args.batch_size, model.audio_config)
     dloader = iter(DataLoader(ds, batch_size=None, num_workers=args.n_workers, pin_memory=True))
 
     save_dir = Path("runs/librispeech") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -163,8 +161,7 @@ if __name__ == "__main__":
     log_interval = 50
     pbar = tqdm(total=args.n_steps, dynamic_ncols=True)
     model.train()
-    n_audio_toks = 0
-    n_text_toks = 0
+    n_toks = 0
     time0 = time.perf_counter()
 
     while step < args.n_steps:
@@ -172,8 +169,7 @@ if __name__ == "__main__":
         loss_fn = torch.compile(get_loss) if args.compile else get_loss
         loss = loss_fn(model, audio.cuda(), tokens.cuda(), labels.cuda())
         loss.backward()
-        n_audio_toks += audio.numel() // ds.audio_stride
-        n_text_toks += (labels != -100).sum()
+        n_toks += (labels != -100).sum()
 
         if step % log_interval == 0:
             log_dict = dict(
@@ -184,10 +180,9 @@ if __name__ == "__main__":
             )
             if step > 0:
                 time1 = time.perf_counter()
-                log_dict["text_toks_per_second"] = n_text_toks / (time1 - time0)
-                log_dict["audio_toks_per_second"] = n_audio_toks / (time1 - time0)
-                n_audio_toks = 0
-                n_text_toks = 0
+                log_dict["toks_per_second"] = n_toks / (time1 - time0)
+                log_dict["audio_secs_per_second"] = (args.audio_duration * args.batch_size) / (time1 - time0)
+                n_toks = 0
                 time0 = time1
             run.log(log_dict, step=step)
             pbar.set_postfix(loss=log_dict["loss"])
