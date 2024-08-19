@@ -29,27 +29,32 @@ class Llama3_1Audio(Llama3_1):
             nn.GELU(),
         )
 
-    def build_cache(self):
-        super().build_cache()
+    def build_cache(self, inference: bool = False):
+        super().build_cache(inference)
         self.melspec = MelSpectrogram(**self.audio_config._asdict(), norm="slaney", mel_scale="slaney")
         self.melspec.spectrogram.forward = torch._dynamo.disable(self.melspec.spectrogram.forward)
 
     def forward(
         self,
-        audio: Tensor,
+        audio: Tensor | None,
         tokens: Tensor,
         *,
-        mask: Tensor | None = None,
         input_pos: Tensor | None = None,
     ) -> Tensor:
-        # we need to slice the last time step to make it a nice multiple
-        audio = self.melspec(audio)[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
-        audio = audio - audio.mean(2, keepdim=True)  # cmn
-        audio = audio.to(dtype=self.tok_embeddings.weight.dtype)
-        audio = self.audio_embed(audio).transpose(1, 2)
+        # this is used for inference i.e. generate
+        mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
 
-        tok_embs = self.tok_embeddings(tokens)
-        x = torch.cat([audio, tok_embs], dim=1)
+        x = self.tok_embeddings(tokens)
+
+        if audio is not None:
+            # we need to slice the last time step to make it a nice multiple
+            audio = self.melspec(audio)[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
+            audio = audio - audio.mean(2, keepdim=True)  # cmn
+            audio = audio.to(dtype=self.tok_embeddings.weight.dtype)
+            audio = self.audio_embed(audio).transpose(1, 2)
+
+            # prefix audio
+            x = torch.cat([audio, x], dim=1)
 
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:

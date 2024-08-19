@@ -131,8 +131,6 @@ class Attention(nn.Module):
             out = flex_attention(q, k, v, block_mask=block_mask)
 
         else:
-            if mask is not None:
-                mask = mask[:, None, :, :]
             is_causal = self.kv_cache is None and mask is None
             dropout = self.attn_dropout if self.training else 0.0
             out = F.scaled_dot_product_attention(q, k, v, mask, dropout, is_causal, enable_gqa=True)
@@ -184,8 +182,15 @@ class Llama3_1(nn.Module):
         self.output = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.config = config
 
-    def build_cache(self):
+    def build_cache(self, inference: bool = False):
         self.register_buffer("rope", build_llama3_1_rope(self.config), persistent=False)
+
+        if inference:
+            for layer in self.layers:
+                layer.attention.kv_cache = KVCache(1, self.config, self.tok_embeddings.weight.dtype)
+
+            L = self.config.max_seq_len
+            self.register_buffer("causal_mask", torch.tril(torch.ones(L, L, dtype=torch.bool)), persistent=False)
 
     @torch._dynamo.disable
     def build_block_mask(self, x: Tensor, prefix_lengths: Tensor):
@@ -199,15 +204,17 @@ class Llama3_1(nn.Module):
         self,
         x: Tensor,
         *,
-        mask: Tensor | None = None,
         input_pos: Tensor | None = None,
         prefix_lengths: Tensor | None = None,
     ) -> Tensor:
         if prefix_lengths is not None:
-            assert mask is None and input_pos is None
+            assert input_pos is None
             block_mask = self.build_block_mask(x, prefix_lengths)
         else:
             block_mask = None
+
+        # this is used for inference i.e. generate
+        mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
 
         x = self.tok_embeddings(x)
         rope = self.rope[: x.shape[1]]
@@ -218,6 +225,7 @@ class Llama3_1(nn.Module):
                 )
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
+
         x = self.norm(x)
         x = self.output(x)
         return x
