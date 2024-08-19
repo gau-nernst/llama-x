@@ -22,7 +22,7 @@ class Llama3_1Audio(Llama3_1):
         self.audio_config = audio_config
 
         # inspired by Whisper encoder
-        self.conv = nn.Sequential(
+        self.audio_embed = nn.Sequential(
             nn.Conv1d(audio_config.n_mels, config.embed_dim, 3, 1, 1),
             nn.GELU(),
             nn.Conv1d(config.embed_dim, config.embed_dim, 3, 2, 1),
@@ -32,6 +32,7 @@ class Llama3_1Audio(Llama3_1):
     def build_cache(self):
         super().build_cache()
         self.melspec = MelSpectrogram(**self.audio_config._asdict())
+        self.melspec.spectrogram.forward = torch._dynamo.disable(self.melspec.spectrogram.forward)
 
     def forward(
         self,
@@ -44,8 +45,8 @@ class Llama3_1Audio(Llama3_1):
         # we need to slice the last time step to make it a nice multiple
         audio = self.melspec(audio)[..., :-1].clip(1e-12).log()  # (B, n_mels, L)
         audio = audio - audio.mean(2, keepdim=True)  # cmn
-        audio = audio.to(dtype=self.conv[0].weight.dtype)
-        audio = self.conv(audio).transpose(1, 2)
+        audio = audio.to(dtype=self.audio_embed[0].weight.dtype)
+        audio = self.audio_embed(audio).transpose(1, 2)
 
         tok_embs = self.tok_embeddings(tokens)
         x = torch.cat([audio, tok_embs], dim=1)
@@ -71,9 +72,9 @@ def _build_audio_model(base_model: Llama3_1, **kwargs):
         print(incompat_keys)
 
     # these weights don't exist in state_dict. must manually initialize them from meta device.
-    model.conv.to_empty(device="cpu")
-    model.conv.to(dtype=model.tok_embeddings.weight.dtype)
-    for m in model.conv.modules():
+    model.audio_embed.to_empty(device="cpu")
+    model.audio_embed.to(dtype=model.tok_embeddings.weight.dtype)
+    for m in model.audio_embed.modules():
         if isinstance(m, nn.Conv1d):
             m.reset_parameters()
 
