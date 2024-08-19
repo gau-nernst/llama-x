@@ -31,7 +31,7 @@ class Llama3_1Audio(Llama3_1):
 
     def build_cache(self):
         super().build_cache()
-        self.melspec = MelSpectrogram(**self.audio_config._asdict())
+        self.melspec = MelSpectrogram(**self.audio_config._asdict(), norm="slaney", mel_scale="slaney")
         self.melspec.spectrogram.forward = torch._dynamo.disable(self.melspec.spectrogram.forward)
 
     def forward(
@@ -43,7 +43,7 @@ class Llama3_1Audio(Llama3_1):
         input_pos: Tensor | None = None,
     ) -> Tensor:
         # we need to slice the last time step to make it a nice multiple
-        audio = self.melspec(audio)[..., :-1].clip(1e-12).log()  # (B, n_mels, L)
+        audio = self.melspec(audio)[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
         audio = audio - audio.mean(2, keepdim=True)  # cmn
         audio = audio.to(dtype=self.tok_embeddings.weight.dtype)
         audio = self.audio_embed(audio).transpose(1, 2)

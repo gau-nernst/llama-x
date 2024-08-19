@@ -72,6 +72,23 @@ def apply_rope(x: Tensor, rope: Tensor) -> Tensor:
     return out.flatten(3).type_as(x)
 
 
+class KVCache(nn.Module):
+    def __init__(self, batch_size: int, config: Llama3_1Config, dtype: torch.dtype):
+        super().__init__()
+        shape = (batch_size, config.num_kv_heads, config.max_seq_len, config.head_dim)
+        self.register_buffer("k_cache", torch.zeros(shape, dtype=dtype), persistent=False)
+        self.register_buffer("v_cache", torch.zeros(shape, dtype=dtype), persistent=False)
+
+    def update(self, input_pos: Tensor, k: Tensor, v: Tensor):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k.shape[2]
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k
+        v_out[:, :, input_pos] = v
+        return k_out, v_out
+
+
 class Attention(nn.Module):
     def __init__(self, config: Llama3_1Config) -> None:
         super().__init__()
@@ -117,7 +134,8 @@ class Attention(nn.Module):
             if mask is not None:
                 mask = mask[:, None, :, :]
             is_causal = self.kv_cache is None and mask is None
-            out = F.scaled_dot_product_attention(q, k, v, mask, self.attn_dropout, is_causal, enable_gqa=True)
+            dropout = self.attn_dropout if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, mask, dropout, is_causal, enable_gqa=True)
 
         out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
         return self.wo(out)
