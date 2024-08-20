@@ -131,6 +131,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
 
+    parser.add_argument("--resume")
     parser.add_argument("--ckpt_interval", type=int, default=1000)
     parser.add_argument("--project")
     parser.add_argument("--run_name", default="debug")
@@ -163,8 +164,15 @@ if __name__ == "__main__":
     run = wandb.init(project=args.project, name=args.run_name, config=args, dir="/tmp")
 
     step = 0
+
+    if args.resume is not None:
+        state_dict = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
+        step = state_dict["step"]
+        model.load_state_dict(state_dict["model"])
+        optim.load_state_dict(state_dict["optim"])
+
     log_interval = 50
-    pbar = tqdm(total=args.n_steps, dynamic_ncols=True)
+    pbar = tqdm(initial=step, total=args.n_steps, dynamic_ncols=True)
     model.train()
     n_toks = 0
     time0 = time.perf_counter()
