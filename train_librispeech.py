@@ -18,8 +18,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
-import modelling
-from modelling import AudioConfig, Int8LoRALinear, Llama3Tokenizer
+from modelling import AudioConfig, Int8LoRALinear, Llama3Tokenizer, LlamaAudio
 from train_utils import get_grad_norm, print_model_stats
 
 
@@ -109,7 +108,7 @@ class LibriSpeech(IterableDataset):
                 duration += this_duration
 
 
-def get_loss(model: modelling.Llama3_1, audio: Tensor, tokens: Tensor, labels: Tensor):
+def get_loss(model: LlamaAudio, audio: Tensor, tokens: Tensor, labels: Tensor):
     return F.cross_entropy(model(audio, tokens).flatten(0, 1), labels.flatten())
 
 
@@ -141,7 +140,9 @@ if __name__ == "__main__":
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model: modelling.Llama3_1Audio = getattr(modelling, args.model)(
+    model = LlamaAudio.from_hf(
+        args.model,
+        pretrained=True,
         max_seq_len=4096,
         activation_checkpointing=args.activation_checkpointing,
     )

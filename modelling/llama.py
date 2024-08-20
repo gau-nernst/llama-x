@@ -2,20 +2,21 @@
 # https://github.com/pytorch/torchtune
 # https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 
+import json
 from typing import NamedTuple
 
 import safetensors
 import tiktoken
 import torch
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 from tiktoken.load import load_tiktoken_bpe
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
-class Llama3_1Config(NamedTuple):
+class LlamaConfig(NamedTuple):
     embed_dim: int
     num_layers: int
     head_dim: int
@@ -23,9 +24,10 @@ class Llama3_1Config(NamedTuple):
     num_kv_heads: int
     intermediate_dim: int
     max_seq_len: int = 2048
-    vocab_size: int = 128256
+    vocab_size: int = 128_256  # Llama3
     attn_dropout: float = 0.0
     rope_base: int = 50_000
+    is_llama3_1: bool = False
     activation_checkpointing: bool = False
 
 
@@ -51,9 +53,10 @@ def scale_llama3_1_rope(freqs: torch.Tensor):
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
 
-def build_llama3_1_rope(config: Llama3_1Config):
-    freqs = 1.0 / (config.rope_base ** (torch.arange(0, config.head_dim, 2, dtype=torch.float32) / config.head_dim))
-    theta = scale_llama3_1_rope(freqs)
+def build_rope(config: LlamaConfig):
+    theta = 1.0 / (config.rope_base ** (torch.arange(0, config.head_dim, 2, dtype=torch.float32) / config.head_dim))
+    if config.is_llama3_1:
+        theta = scale_llama3_1_rope(theta)
     seq_idx = torch.arange(config.max_seq_len, dtype=torch.float32)
     idx_theta = torch.einsum("i, j -> ij", seq_idx, theta)
     return torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
@@ -73,7 +76,7 @@ def apply_rope(x: Tensor, rope: Tensor) -> Tensor:
 
 
 class KVCache(nn.Module):
-    def __init__(self, batch_size: int, config: Llama3_1Config, dtype: torch.dtype):
+    def __init__(self, batch_size: int, config: LlamaConfig, dtype: torch.dtype):
         super().__init__()
         shape = (batch_size, config.num_kv_heads, config.max_seq_len, config.head_dim)
         self.register_buffer("k_cache", torch.zeros(shape, dtype=dtype), persistent=False)
@@ -90,7 +93,7 @@ class KVCache(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: Llama3_1Config) -> None:
+    def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
         self.num_heads = config.num_heads
         self.num_kv_heads = config.num_kv_heads
@@ -140,7 +143,7 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: Llama3_1Config):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.w1 = nn.Linear(config.embed_dim, config.intermediate_dim, bias=False)
         self.w3 = nn.Linear(config.embed_dim, config.intermediate_dim, bias=False)
@@ -152,7 +155,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, config: Llama3_1Config) -> None:
+    def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
         self.attention_norm = nn.RMSNorm(config.embed_dim, eps=1e-5)
         self.attention = Attention(config)
@@ -173,8 +176,8 @@ class TransformerLayer(nn.Module):
         return x
 
 
-class Llama3_1(nn.Module):
-    def __init__(self, config: Llama3_1Config) -> None:
+class Llama(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.embed_dim)
         self.layers = nn.ModuleList([TransformerLayer(config) for _ in range(config.num_layers)])
@@ -183,7 +186,7 @@ class Llama3_1(nn.Module):
         self.config = config
 
     def build_cache(self, inference: bool = False):
-        self.register_buffer("rope", build_llama3_1_rope(self.config), persistent=False)
+        self.register_buffer("rope", build_rope(self.config), persistent=False)
 
         if inference:
             for layer in self.layers:
@@ -228,6 +231,43 @@ class Llama3_1(nn.Module):
 
         return self.output(self.norm(x))
 
+    @staticmethod
+    def from_hf(model_id: str, pretrained: bool = False, **kwargs):
+        config = _get_hf_config(model_id)
+        config = config._replace(**kwargs)
+        with torch.device("meta"):
+            model = Llama(config).eval()
+
+        if pretrained:
+            model.load_state_dict(_get_hf_state_dict(model_id), assign=True)
+        else:
+            model.to_empty(device="cpu")
+
+        # we cannot build cache under meta device context. thus, build cache after loading weights
+        model.build_cache()
+        return model
+
+
+def _get_hf_config(model_id: str):
+    config_path = hf_hub_download(model_id, "config.json")
+    hf_config = json.load(open(config_path))
+    assert hf_config["architectures"][0] == "LlamaForCausalLM"
+
+    config = LlamaConfig(
+        embed_dim=hf_config["hidden_size"],
+        num_layers=hf_config["num_hidden_layers"],
+        head_dim=hf_config.get("head_dim", hf_config["hidden_size"] // hf_config["num_attention_heads"]),
+        num_heads=hf_config["num_attention_heads"],
+        num_kv_heads=hf_config["num_key_value_heads"],
+        intermediate_dim=hf_config["intermediate_size"],
+        vocab_size=hf_config["vocab_size"],
+        rope_base=hf_config["rope_theta"],
+    )
+    # TODO: may need more rigorous check
+    if hf_config.get("rope_scaling", None) is not None:
+        config = config._replace(is_llama3_1=hf_config["rope_scaling"]["rope_type"] == "llama3")
+    return config
+
 
 def _rename_hf_key(key: str):
     return (
@@ -246,56 +286,15 @@ def _rename_hf_key(key: str):
     )
 
 
-def _build_model(model_id: str, filenames: list[str], **kwargs):
-    config = Llama3_1Config(**kwargs)
-    with torch.device("meta"):
-        model = Llama3_1(config).eval()
-
+def _get_hf_state_dict(model_id: str):
+    filenames = [x for x in list_repo_files(model_id) if x.endswith(".safetensors")]
     state_dict = dict()
     for filename in filenames:
         filepath = hf_hub_download(model_id, filename)
-
-        if filepath.endswith(".safetensors"):
-            with safetensors.safe_open(filepath, framework="pt") as f:
-                for k in f.keys():
-                    state_dict[_rename_hf_key(k)] = f.get_tensor(k)
-
-        else:
-            this_state_dict = torch.load(filepath, map_location="cpu", weights_only=True, mmap=True)
-            state_dict.update(this_state_dict)
-
-    # we cannot build cache under meta device context. thus, build cache after loading weights
-    model.load_state_dict(state_dict, assign=True)
-    model.build_cache()
-    return model
-
-
-def llama3_1_8b(**kwargs):
-    return _build_model(
-        "meta-llama/Meta-Llama-3.1-8B-Instruct",
-        ["original/consolidated.00.pth"],
-        embed_dim=4096,
-        head_dim=128,
-        num_layers=32,
-        num_heads=32,
-        num_kv_heads=8,
-        intermediate_dim=14_336,
-        **kwargs,
-    )
-
-
-def llama3_1_4b(**kwargs):
-    return _build_model(
-        "nvidia/Llama-3.1-Minitron-4B-Width-Base",
-        ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
-        embed_dim=3072,
-        head_dim=128,
-        num_layers=32,
-        num_heads=32,
-        num_kv_heads=8,
-        intermediate_dim=9216,
-        **kwargs,
-    )
+        with safetensors.safe_open(filepath, framework="pt") as f:
+            for k in f.keys():
+                state_dict[_rename_hf_key(k)] = f.get_tensor(k)
+    return state_dict
 
 
 # https://github.com/pytorch/torchtune/blob/main/torchtune/models/llama3/_tokenizer.py

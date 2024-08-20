@@ -15,8 +15,7 @@ from datasets import load_dataset
 from torch import Tensor
 from tqdm import tqdm
 
-import modelling
-from modelling import Int8LoRALinear, Llama3Tokenizer
+from modelling import Int8LoRALinear, Llama, Llama3Tokenizer
 from train_utils import get_grad_norm, print_model_stats
 
 
@@ -69,7 +68,7 @@ def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 25
     return _data_iter(ds["input_ids"], ds["prefix_length"], batch_size, seq_len_multiple), len(ds)
 
 
-def get_loss(model: modelling.Llama3_1, inputs: Tensor, labels: Tensor, prefix_lengths: Tensor | None = None):
+def get_loss(model: Llama, inputs: Tensor, labels: Tensor, prefix_lengths: Tensor | None = None):
     logits = model(inputs, prefix_lengths=prefix_lengths)[:, :-1].flatten(0, 1)
     labels = labels[:, 1:].flatten()
     return F.cross_entropy(logits, labels)
@@ -77,7 +76,7 @@ def get_loss(model: modelling.Llama3_1, inputs: Tensor, labels: Tensor, prefix_l
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="llama3_1_4b")
+    parser.add_argument("--model", default="nvidia/Llama-3.1-Minitron-4B-Width-Base")
     parser.add_argument("--prefix_lm", action="store_true")
     parser.add_argument("--freeze_embedding_layer", action="store_true")
     parser.add_argument("--activation_checkpointing", action="store_true")
@@ -101,7 +100,9 @@ if __name__ == "__main__":
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model: modelling.Llama3_1 = getattr(modelling, args.model)(
+    model = Llama.from_hf(
+        args.model,
+        pretrained=True,
         max_seq_len=args.max_seq_len,
         activation_checkpointing=args.activation_checkpointing,
     )
