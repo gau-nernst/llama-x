@@ -146,10 +146,10 @@ if __name__ == "__main__":
     )
     if args.freeze_embedding_layer:
         model.tok_embeddings.requires_grad_(False)
-    Int8LoRALinear.convert_model(model.layers, rank=args.lora)
+    Int8LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
 
     # quantize, non-trainble, no LoRA
-    model.output = Int8LoRALinear.convert_model(model.output, rank=0)
+    model.output = Int8LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
     model.cuda()
     print_model_stats(model)
 
