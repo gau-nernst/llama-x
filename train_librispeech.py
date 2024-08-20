@@ -18,14 +18,16 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
-from modelling import AudioConfig, Int8LoRALinear, Llama3Tokenizer, LlamaAudio
-from train_utils import get_grad_norm, print_model_stats
+from modelling import AudioConfig, Int8LoRALinear, LlamaAudio
+from tokenizers import Llama2Tokenizer, Llama3Tokenizer
+from train_utils import LRScheduler, get_grad_norm, print_model_stats
 
 
 class LibriSpeech(IterableDataset):
     def __init__(
         self,
         data_dir: str,
+        tokenizer: str,
         audio_duration: float,
         seq_len_multiple: int,
         batch_size: int,
@@ -38,17 +40,20 @@ class LibriSpeech(IterableDataset):
         self.batch_size = batch_size
         self.audio_config = audio_config
 
-        tokenizer = Llama3Tokenizer()
+        _tokenizer = dict(llama2=Llama2Tokenizer, llama3=Llama3Tokenizer)[tokenizer]()
         self.samples = []
         for file in self.data_dir.glob("**/*.trans.txt"):
             for line in open(file):
                 audio_fname, text = line.rstrip().split(" ", 1)
 
             audio_path = str((file.parent / f"{audio_fname}.flac").relative_to(self.data_dir))
-            tokens = tokenizer(f" {text.lower()}.")
+            tokens = _tokenizer(f" {text.lower()}.")
             self.samples.append((audio_path, tokens))
 
         self.samples.sort()
+        self.bos_id = _tokenizer.bos_id
+        self.eos_id = _tokenizer.eos_id
+        self.pad_id = _tokenizer.pad_id
 
     def _prepare_batch(self, batch: list[tuple[Tensor, Tensor]]):
         audio_batch, _tokens_batch = zip(*batch)
@@ -62,7 +67,7 @@ class LibriSpeech(IterableDataset):
         labels_batch = []
         for tokens in _tokens_batch:
             pad = tokens_length - len(tokens)
-            tokens_batch.append(tokens + [Llama3Tokenizer.pad_id] * pad)
+            tokens_batch.append(tokens + [self.pad_id] * pad)
             labels_batch.append(tokens[1:] + [-100] * (pad + 1))
 
         tokens_batch = torch.tensor(tokens_batch)
@@ -73,7 +78,7 @@ class LibriSpeech(IterableDataset):
     def __iter__(self):
         batch = []
         audio = []
-        tokens = [Llama3Tokenizer.bos_id]
+        tokens = [self.bos_id]
         duration = 0
 
         while True:
@@ -92,7 +97,7 @@ class LibriSpeech(IterableDataset):
 
                 if duration + this_duration > self.audio_duration:
                     audio = torch.cat(audio, dim=0)
-                    tokens.append(Llama3Tokenizer.eos_id)
+                    tokens.append(self.eos_id)
 
                     batch.append((audio, tokens))
                     if len(batch) == self.batch_size:
@@ -100,7 +105,7 @@ class LibriSpeech(IterableDataset):
                         batch = []
 
                     audio = []
-                    tokens = [Llama3Tokenizer.bos_id]
+                    tokens = [self.bos_id]
                     duration = 0
 
                 audio.append(this_audio)
@@ -114,12 +119,13 @@ def get_loss(model: LlamaAudio, audio: Tensor, tokens: Tensor, labels: Tensor):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="llama3_1_audio_8b")
+    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--freeze_embedding_layer", action="store_true")
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--lora", type=int, default=8)
+    parser.add_argument("--lora", type=int)
 
+    parser.add_argument("--tokenizer", default="llama3")
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--audio_duration", type=float, default=40)
     parser.add_argument("--seq_len_multiple", type=int, default=128)
@@ -129,6 +135,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
+    parser.add_argument("--warmup", type=float, default=0.0)
+    parser.add_argument("--decay", type=float, default=0.0)
+    parser.add_argument("--clip_grad_norm", type=float)
 
     parser.add_argument("--resume")
     parser.add_argument("--ckpt_interval", type=int, default=1000)
@@ -147,16 +156,25 @@ if __name__ == "__main__":
     )
     if args.freeze_embedding_layer:
         model.tok_embeddings.requires_grad_(False)
-    Int8LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
 
-    # quantize, non-trainble, no LoRA
-    model.output = Int8LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
+    if args.lora is not None:
+        Int8LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
+        # quantize, non-trainble, no LoRA
+        model.output = Int8LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
     model.cuda()
     print_model_stats(model)
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+    lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
-    ds = LibriSpeech(args.dataset_dir, args.audio_duration, args.seq_len_multiple, args.batch_size, model.audio_config)
+    ds = LibriSpeech(
+        args.dataset_dir,
+        args.tokenizer,
+        args.audio_duration,
+        args.seq_len_multiple,
+        args.batch_size,
+        model.audio_config,
+    )
     dloader = iter(DataLoader(ds, batch_size=None, num_workers=args.n_workers, pin_memory=True))
 
     save_dir = Path("runs/librispeech") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -184,10 +202,19 @@ if __name__ == "__main__":
         loss.backward()
         n_toks += (labels != -100).sum()
 
+        lr = lr_schedule.get_lr(step)
+        for param_group in optim.param_groups:
+            param_group["lr"] = lr
+
+        if args.clip_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+        else:
+            grad_norm = None
+
         if step % log_interval == 0:
             log_dict = dict(
                 loss=loss.item(),
-                grad_norm=get_grad_norm(model),
+                grad_norm=get_grad_norm(model) if grad_norm is None else grad_norm,
                 lr=optim.param_groups[0]["lr"],
                 max_memory_allocated=torch.cuda.max_memory_allocated(),
             )

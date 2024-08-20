@@ -15,7 +15,8 @@ from datasets import load_dataset
 from torch import Tensor
 from tqdm import tqdm
 
-from modelling import Int8LoRALinear, Llama, Llama3Tokenizer
+from modelling import Int8LoRALinear, Llama
+from tokenizers import Llama3Tokenizer
 from train_utils import get_grad_norm, print_model_stats
 
 

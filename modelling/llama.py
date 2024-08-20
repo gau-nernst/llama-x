@@ -6,11 +6,9 @@ import json
 from typing import NamedTuple
 
 import safetensors
-import tiktoken
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, list_repo_files
-from tiktoken.load import load_tiktoken_bpe
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
@@ -291,38 +289,3 @@ def _get_hf_state_dict(model_id: str):
             for k in f.keys():
                 state_dict[_rename_hf_key(k)] = f.get_tensor(k)
     return state_dict
-
-
-# https://github.com/pytorch/torchtune/blob/main/torchtune/models/llama3/_tokenizer.py
-class Llama3Tokenizer:
-    bos_id = 128_000
-    eos_id = 128_001
-    pad_id = 128_004
-
-    def __init__(self):
-        tokenizer_path = hf_hub_download("meta-llama/Meta-Llama-3.1-8B-Instruct", "original/tokenizer.model")
-        pat_str = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
-        tokenizer = tiktoken.Encoding(
-            "llama3",
-            pat_str=pat_str,
-            mergeable_ranks=load_tiktoken_bpe(tokenizer_path),
-            # we need to define this to decode these tokens
-            special_tokens={
-                "<|begin_of_text|>": 128000,
-                "<|end_of_text|>": 128001,
-                "<|finetune_right_pad_id|>": 128004,
-            },
-        )
-        self.tokenizer = tokenizer
-
-    def __call__(self, text: str, add_bos: bool = False, add_eos: bool = False):
-        tokens = []
-        if add_bos:
-            tokens.append(self.bos_id)
-        tokens.extend(self.tokenizer.encode(text, disallowed_special=()))
-        if add_eos:
-            tokens.append(self.eos_id)
-        return tokens
-
-    def decode(self, tokens: list[int]):
-        return self.tokenizer.decode(tokens)
