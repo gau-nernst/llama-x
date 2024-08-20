@@ -81,7 +81,7 @@ class KVCache(nn.Module):
 
     def update(self, input_pos: Tensor, k: Tensor, v: Tensor):
         # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k.shape[2]
+        assert input_pos.shape[0] == k.shape[2], (input_pos.shape, k.shape)
         k_out = self.k_cache
         v_out = self.v_cache
         k_out[:, :, input_pos] = k
@@ -226,9 +226,7 @@ class Llama3_1(nn.Module):
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
 
-        x = self.norm(x)
-        x = self.output(x)
-        return x
+        return self.output(self.norm(x))
 
 
 def _rename_hf_key(key: str):

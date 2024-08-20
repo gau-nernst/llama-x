@@ -111,10 +111,11 @@ def get_loss(model: modelling.Llama3_1, audio: Tensor, tokens: Tensor, labels: T
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="llama3_1_audio_4b")
+    parser.add_argument("--model", default="llama3_1_audio_8b")
     parser.add_argument("--freeze_embedding_layer", action="store_true")
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--lora", type=int, default=8)
 
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--audio_duration", type=float, default=40)
@@ -141,7 +142,7 @@ if __name__ == "__main__":
     )
     if args.freeze_embedding_layer:
         model.tok_embeddings.requires_grad_(False)
-    Int8LoRALinear.convert_model(model.layers)
+    Int8LoRALinear.convert_model(model.layers, rank=args.lora)
 
     # quantize, non-trainble, no LoRA
     model.output = Int8LoRALinear.convert_model(model.output, rank=0)

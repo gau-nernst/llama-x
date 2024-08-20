@@ -51,7 +51,11 @@ class Llama3_1Audio(Llama3_1):
             audio = self.melspec(audio)[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
             audio = audio - audio.mean(2, keepdim=True)  # cmn
             audio = audio.to(dtype=self.tok_embeddings.weight.dtype)
-            audio = self.audio_embed(audio).transpose(1, 2)
+            if self.config.activation_checkpointing:
+                audio = checkpoint(self.audio_embed, audio, use_reentrant=False)
+            else:
+                audio = self.audio_embed(audio)
+            audio = audio.transpose(1, 2)
 
             # prefix audio
             x = torch.cat([audio, x], dim=1)
@@ -63,10 +67,9 @@ class Llama3_1Audio(Llama3_1):
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos)
 
-        x = x[:, audio.shape[1] :]  # remove audio embs
-        x = self.norm(x)
-        x = self.output(x)
-        return x
+        if audio is not None:
+            x = x[:, audio.shape[1] :]  # remove audio embs
+        return self.output(self.norm(x))
 
 
 def _build_audio_model(base_model: Llama3_1, **kwargs):
