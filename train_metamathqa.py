@@ -102,7 +102,6 @@ if __name__ == "__main__":
 
     model = Llama.from_hf(
         args.model,
-        pretrained=True,
         max_seq_len=args.max_seq_len,
         activation_checkpointing=args.activation_checkpointing,
     )

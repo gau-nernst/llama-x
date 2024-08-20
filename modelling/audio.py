@@ -72,7 +72,7 @@ class LlamaAudio(Llama):
         return self.output(self.norm(x))
 
     @staticmethod
-    def from_hf(model_id: str, pretrained: bool = False, **kwargs):
+    def from_hf(model_id: str, **kwargs):
         audio_kwargs = {k: kwargs.pop(k) for k in kwargs if k in AudioConfig._fields}
         audio_config = AudioConfig(**audio_kwargs)
         config = _get_hf_config(model_id)
@@ -80,20 +80,16 @@ class LlamaAudio(Llama):
         with torch.device("meta"):
             model = LlamaAudio(config, audio_config).eval()
 
-        if pretrained:
-            incompat_keys = model.load_state_dict(_get_hf_state_dict(model_id), strict=False, assign=True)
-            if incompat_keys:
-                print(incompat_keys)
+        incompat_keys = model.load_state_dict(_get_hf_state_dict(model_id), strict=False, assign=True)
+        if incompat_keys:
+            print(incompat_keys)
 
-            # these weights don't exist in state_dict. must manually initialize them from meta device.
-            model.audio_embed.to_empty(device="cpu")
-            model.audio_embed.to(dtype=model.tok_embeddings.weight.dtype)
-            for m in model.audio_embed.modules():
-                if isinstance(m, nn.Conv1d):
-                    m.reset_parameters()
-
-        else:
-            model.to_empty(device="cpu")
+        # these weights don't exist in state_dict. must manually initialize them from meta device.
+        model.audio_embed.to_empty(device="cpu")
+        model.audio_embed.to(dtype=model.tok_embeddings.weight.dtype)
+        for m in model.audio_embed.modules():
+            if isinstance(m, nn.Conv1d):
+                m.reset_parameters()
 
         # we cannot build cache under meta device context. thus, build cache after loading weights
         model.build_cache()

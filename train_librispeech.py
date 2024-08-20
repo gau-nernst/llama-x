@@ -142,7 +142,6 @@ if __name__ == "__main__":
 
     model = LlamaAudio.from_hf(
         args.model,
-        pretrained=True,
         max_seq_len=4096,
         activation_checkpointing=args.activation_checkpointing,
     )

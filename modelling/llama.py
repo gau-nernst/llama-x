@@ -232,18 +232,14 @@ class Llama(nn.Module):
         return self.output(self.norm(x))
 
     @staticmethod
-    def from_hf(model_id: str, pretrained: bool = False, **kwargs):
+    def from_hf(model_id: str, **kwargs):
         config = _get_hf_config(model_id)
         config = config._replace(**kwargs)
         with torch.device("meta"):
             model = Llama(config).eval()
 
-        if pretrained:
-            model.load_state_dict(_get_hf_state_dict(model_id), assign=True)
-        else:
-            model.to_empty(device="cpu")
-
         # we cannot build cache under meta device context. thus, build cache after loading weights
+        model.load_state_dict(_get_hf_state_dict(model_id), assign=True)
         model.build_cache()
         return model
 
