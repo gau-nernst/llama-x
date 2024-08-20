@@ -86,7 +86,11 @@ class LibriSpeech(IterableDataset):
                 assert fs == self.audio_config.sample_rate
                 this_audio = this_audio.mean(0)
 
+                # TODO: think about how to handle this better
                 this_duration = this_audio.shape[0] / fs
+                if this_duration > self.audio_duration:
+                    continue
+
                 if duration + this_duration > self.audio_duration:
                     audio = torch.cat(audio, dim=0)
                     tokens.append(Llama3Tokenizer.eos_id)
