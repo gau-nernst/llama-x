@@ -5,6 +5,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import json
 import math
 import time
 from datetime import datetime
@@ -18,9 +19,10 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
-from modelling import AudioConfig, LlamaAudio, LoRALinear
+from modelling import AudioConfig, LlamaAudio, apply_linear_adapter_
+from subclasses import quantize_linear_
 from tokenizers import Llama2Tokenizer, Llama3Tokenizer
-from train_utils import LRScheduler, get_grad_norm, print_model_stats
+from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
 
 
 class LibriSpeech(IterableDataset):
@@ -120,7 +122,10 @@ def get_loss(model: LlamaAudio, audio: Tensor, tokens: Tensor, labels: Tensor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--freeze_embedding_layer", action="store_true")
+    parser.add_argument("--adapter")
+    parser.add_argument("--adapter_kwargs", type=json.loads, default=dict())
+    parser.add_argument("--quantize")
+    parser.add_argument("--quantize_kwargs", type=json.loads, default=dict())
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--lora", type=int)
@@ -154,13 +159,11 @@ if __name__ == "__main__":
         max_seq_len=4096,
         activation_checkpointing=args.activation_checkpointing,
     )
-    if args.freeze_embedding_layer:
-        model.tok_embeddings.requires_grad_(False)
+    freeze_params(model, args.freeze_prefixes)
+    quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
+    apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
+    # TODO: handle quantization/LoRA for LM head separately
 
-    if args.lora is not None:
-        LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
-        # quantize, non-trainble, no LoRA
-        model.output = LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
     model.cuda()
     print_model_stats(model)
 

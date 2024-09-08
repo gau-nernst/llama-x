@@ -16,7 +16,7 @@ from datasets import load_dataset
 from torch import Tensor
 from tqdm import tqdm
 
-from modelling import Llama, LoRALinear
+from modelling import Llama, apply_linear_adapter_
 from subclasses import quantize_linear_
 from tokenizers import Llama3Tokenizer
 from train_utils import freeze_params, get_grad_norm, print_model_stats
@@ -80,7 +80,8 @@ def get_loss(model: Llama, inputs: Tensor, labels: Tensor, prefix_lengths: Tenso
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/Llama-3.1-Minitron-4B-Width-Base")
-    parser.add_argument("--lora", type=int)
+    parser.add_argument("--adapter")
+    parser.add_argument("--adapter_kwargs", type=json.loads, default=dict())
     parser.add_argument("--quantize")
     parser.add_argument("--quantize_kwargs", type=json.loads, default=dict())
     parser.add_argument("--prefix_lm", action="store_true")
@@ -113,9 +114,7 @@ if __name__ == "__main__":
     )
     freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
-    if args.lora is not None:
-        LoRALinear.convert_model(model.layers)
-
+    apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
     # TODO: handle quantization/LoRA for LM head separately
 
     model.cuda()
