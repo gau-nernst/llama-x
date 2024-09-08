@@ -19,7 +19,7 @@ from tqdm import tqdm
 from modelling import Llama, apply_linear_adapter_
 from subclasses import quantize_linear_
 from tokenizers import Llama3Tokenizer
-from train_utils import freeze_params, get_grad_norm, print_model_stats
+from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
 
 
 def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_size: int, seq_len_multiple: int = 256):
@@ -49,6 +49,10 @@ def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_s
 
 
 def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 256):
+    # using Llama3 tokenizer, seq len stats
+    # - P99: 678
+    # - P99.9: 1089
+    # - max: 2318
     tokenizer = Llama3Tokenizer()
 
     def apply_template(example):
@@ -89,21 +93,28 @@ if __name__ == "__main__":
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
 
-    parser.add_argument("--max_seq_len", type=int, default=2048)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--seq_len_multiple", type=int, default=256)
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_steps", type=int, default=1000)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
+    parser.add_argument("--warmup", type=float, default=0.0)
+    parser.add_argument("--decay", type=float, default=0.0)
+    parser.add_argument("--clip_grad_norm", type=float)
 
     parser.add_argument("--ckpt_interval", type=int, default=1000)
+    parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--project")
-    parser.add_argument("--run_name", default="debug")
+    parser.add_argument("--run_name")
     parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
+    args.torch_version = torch.__version__
+    assert args.batch_size % args.gradient_accumulation == 0
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
@@ -119,11 +130,13 @@ if __name__ == "__main__":
 
     model.cuda()
     print_model_stats(model)
+    print(model)
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+    lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
     train_data_iter, train_size = get_metamathqa(
-        args.batch_size,
+        args.batch_size // args.gradient_accumulation,
         args.max_seq_len,
         seq_len_multiple=args.seq_len_multiple,
     )
@@ -135,23 +148,38 @@ if __name__ == "__main__":
     run = wandb.init(project=args.project, name=args.run_name, config=args, dir="/tmp")
 
     step = 0
-    log_interval = 50
     pbar = tqdm(total=args.n_steps, dynamic_ncols=True)
     model.train()
     n_toks = 0
     time0 = time.perf_counter()
+    loss_fn = torch.compile(get_loss) if args.compile else get_loss
 
     while step < args.n_steps:
-        inputs, labels, lengths, prefix_lengths = next(train_data_iter)
-        loss_fn = torch.compile(get_loss) if args.compile else get_loss
-        loss = loss_fn(model, inputs, labels, prefix_lengths if args.prefix_lm else None)
-        loss.backward()
-        n_toks += lengths.sum()
+        for _ in range(args.gradient_accumulation):
+            inputs, labels, lengths, prefix_lengths = next(train_data_iter)
+            # do a train step with longest seq_len to reserve enough memory + avoid memory fragmentation
+            if step == 0:
+                pad = args.max_seq_len - inputs.shape[1]
+                inputs = F.pad(inputs, (0, pad))
+                labels = F.pad(labels, (0, pad), value=-100)
 
-        if step % log_interval == 0:
+            loss = loss_fn(model, inputs, labels, prefix_lengths if args.prefix_lm else None)
+            (loss / args.gradient_accumulation).backward()
+            n_toks += lengths.sum()
+
+        lr = lr_schedule.get_lr(step)
+        for param_group in optim.param_groups:
+            param_group["lr"] = lr
+
+        if args.clip_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+        else:
+            grad_norm = None
+
+        if step % args.log_interval == 0:
             log_dict = dict(
                 loss=loss.item(),
-                grad_norm=get_grad_norm(model),
+                grad_norm=get_grad_norm(model) if grad_norm is None else grad_norm,
                 lr=optim.param_groups[0]["lr"],
                 max_memory_allocated=torch.cuda.max_memory_allocated(),
             )

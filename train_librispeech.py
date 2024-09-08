@@ -137,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--n_workers", type=int, default=4)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
@@ -151,6 +152,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
+    args.torch_version = torch.__version__
+    assert args.batch_size % args.gradient_accumulation == 0
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
@@ -175,7 +178,7 @@ if __name__ == "__main__":
         args.tokenizer,
         args.audio_duration,
         args.seq_len_multiple,
-        args.batch_size,
+        args.batch_size // args.gradient_accumulation,
         model.audio_config,
     )
     dloader = iter(DataLoader(ds, batch_size=None, num_workers=args.n_workers, pin_memory=True))
@@ -199,11 +202,12 @@ if __name__ == "__main__":
     time0 = time.perf_counter()
 
     while step < args.n_steps:
-        audio, tokens, labels = next(dloader)
-        loss_fn = torch.compile(get_loss) if args.compile else get_loss
-        loss = loss_fn(model, audio.cuda(), tokens.cuda(), labels.cuda())
-        loss.backward()
-        n_toks += (labels != -100).sum()
+        for _ in range(args.gradient_accumulation):
+            audio, tokens, labels = next(dloader)
+            loss_fn = torch.compile(get_loss) if args.compile else get_loss
+            loss = loss_fn(model, audio.cuda(), tokens.cuda(), labels.cuda())
+            (loss / args.gradient_accumulation).backward()
+            n_toks += (labels != -100).sum()
 
         lr = lr_schedule.get_lr(step)
         for param_group in optim.param_groups:

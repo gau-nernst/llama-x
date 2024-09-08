@@ -18,6 +18,10 @@ def apply_linear_adapter_(model: nn.Module, adapter: str | None, **kwargs):
 
 class LoRALinear(nn.Linear):
     def init_adapter(self, rank: int = 8, alpha: float = 8.0) -> None:
+        self.weight.requires_grad_(False)
+        if self.bias is not None:
+            self.bias.requires_grad_(False)
+
         self.rank = rank
         self.alpha = alpha
         self.scale = self.alpha / self.rank
@@ -29,6 +33,9 @@ class LoRALinear(nn.Linear):
 
             nn.init.kaiming_normal_(self.lora_a, a=5**0.5)
             nn.init.zeros_(self.lora_b)
+
+    def extra_repr(self):
+        return f"{super().extra_repr()}, rank={self.rank}, alpha={self.alpha}"
 
     def forward(self, x: Tensor):
         out = F.linear(x, self.weight, self.bias)
