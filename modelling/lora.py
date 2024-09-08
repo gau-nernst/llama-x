@@ -46,20 +46,17 @@ class LoRALinear(nn.Linear):
 
 class DoRALinear(LoRALinear):
     def init_adapter(self, rank: int = 8, alpha: float = 8.0) -> None:
-        super().init_adapter(self, rank, alpha)
+        super().init_adapter(rank, alpha)
         if self.rank > 0:
-            self.m = nn.Parameter(self.weight.norm(p=2, dim=1, keepdim=True))
+            self.m = nn.Parameter(self.weight.norm(p=2, dim=1))
 
     def forward(self, x: Tensor):
+        out = F.linear(x, self.weight)
         if self.rank > 0:
-            weight = self.weight.dequantize()
-            out = F.linear(x, weight)
             out = out + x @ self.lora_a.T @ self.lora_b.T * self.scale
             d_weight = self.lora_b.detach() @ self.lora_a.detach() * self.scale
-            norm = (weight + d_weight).norm(p=2, dim=1, keepdim=True)
+            norm = (self.weight + d_weight).norm(p=2, dim=1)
             out = out * (self.m / norm)
-            if self.bias is not None:
-                out = out + self.bias
-        else:
-            out = F.linear(x, self.weight, self.bias)
+        if self.bias is not None:
+            out = out + self.bias
         return out
