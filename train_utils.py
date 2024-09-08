@@ -1,6 +1,20 @@
 from torch import nn
 
 
+def freeze_params(model: nn.Module, prefixes: list[str]):
+    frozen_names = []
+    for prefix in prefixes:
+        for name, param in model.named_parameters():
+            if name == prefix or name.startswith(f"{prefix}."):
+                frozen_names.append(name)
+                param.requires_grad_(False)
+
+    if frozen_names:
+        print("Freeze the following parameters:")
+        for name in frozen_names:
+            print(f"  - {name}")
+
+
 def get_grad_norm(model: nn.Module):
     return sum(p.grad.square().sum().item() for p in model.parameters() if p.grad is not None) ** 0.5
 

@@ -18,7 +18,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
-from modelling import AudioConfig, Int8LoRALinear, LlamaAudio
+from modelling import AudioConfig, LlamaAudio, LoRALinear
 from tokenizers import Llama2Tokenizer, Llama3Tokenizer
 from train_utils import LRScheduler, get_grad_norm, print_model_stats
 
@@ -158,9 +158,9 @@ if __name__ == "__main__":
         model.tok_embeddings.requires_grad_(False)
 
     if args.lora is not None:
-        Int8LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
+        LoRALinear.convert_model(model.layers, rank=args.lora, quantize_act=True)
         # quantize, non-trainble, no LoRA
-        model.output = Int8LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
+        model.output = LoRALinear.convert_model(model.output, rank=0, quantize_act=True)
     model.cuda()
     print_model_stats(model)
 

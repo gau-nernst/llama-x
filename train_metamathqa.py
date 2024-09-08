@@ -3,6 +3,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import json
 import math
 import time
 from datetime import datetime
@@ -15,9 +16,10 @@ from datasets import load_dataset
 from torch import Tensor
 from tqdm import tqdm
 
-from modelling import Int8LoRALinear, Llama
+from modelling import Llama, LoRALinear
+from subclasses import quantize_linear_
 from tokenizers import Llama3Tokenizer
-from train_utils import get_grad_norm, print_model_stats
+from train_utils import freeze_params, get_grad_norm, print_model_stats
 
 
 def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_size: int, seq_len_multiple: int = 256):
@@ -78,8 +80,11 @@ def get_loss(model: Llama, inputs: Tensor, labels: Tensor, prefix_lengths: Tenso
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/Llama-3.1-Minitron-4B-Width-Base")
+    parser.add_argument("--lora", type=int)
+    parser.add_argument("--quantize")
+    parser.add_argument("--quantize_kwargs", type=json.loads, default=dict())
     parser.add_argument("--prefix_lm", action="store_true")
-    parser.add_argument("--freeze_embedding_layer", action="store_true")
+    parser.add_argument("--freeze_prefixes", nargs="+", default=[])
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
 
@@ -106,12 +111,13 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         activation_checkpointing=args.activation_checkpointing,
     )
-    if args.freeze_embedding_layer:
-        model.tok_embeddings.requires_grad_(False)
-    Int8LoRALinear.convert_model(model.layers)
+    freeze_params(model, args.freeze_prefixes)
+    quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
+    if args.lora is not None:
+        LoRALinear.convert_model(model.layers)
 
-    # quantize, non-trainble, no LoRA
-    model.output = Int8LoRALinear.convert_model(model.output, rank=0)
+    # TODO: handle quantization/LoRA for LM head separately
+
     model.cuda()
     print_model_stats(model)
 
