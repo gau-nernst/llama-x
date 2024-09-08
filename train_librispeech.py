@@ -223,7 +223,8 @@ if __name__ == "__main__":
                 loss=loss.item(),
                 grad_norm=get_grad_norm(model) if grad_norm is None else grad_norm,
                 lr=optim.param_groups[0]["lr"],
-                max_memory_allocated=torch.cuda.max_memory_allocated(),
+                max_memory_allocated=torch.cuda.max_memory_allocated() / 1e9,
+                max_memory_reserved=torch.cuda.max_memory_reserved() / 1e9,
             )
             if step > 0:
                 time1 = time.perf_counter()
