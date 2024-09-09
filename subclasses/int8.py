@@ -102,6 +102,7 @@ class Int8LinearWeight(Tensor):
         raise NotImplementedError(f"{cls.__name__} dispatch: attempting to run {func}, this is not supported")
 
 
+# TODO: try explicit mixed mm kernel
 class _Int8Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: Tensor, weight: Int8LinearWeight, bias: Tensor | None):

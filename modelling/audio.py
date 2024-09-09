@@ -1,6 +1,7 @@
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchaudio.transforms import MelSpectrogram
@@ -40,6 +41,7 @@ class LlamaAudio(Llama):
         tokens: Tensor,
         *,
         input_pos: Tensor | None = None,
+        labels: Tensor | None = None,
     ) -> Tensor:
         # this is used for inference i.e. generate
         mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
@@ -69,7 +71,10 @@ class LlamaAudio(Llama):
 
         if audio is not None:
             x = x[:, audio.shape[1] :]  # remove audio embs
-        return self.output(self.norm(x))
+        x = self.output(self.norm(x))
+        if labels is not None:
+            x = F.cross_entropy(x.view(-1, x.shape[-1]).float(), labels.view(-1))
+        return x
 
     @staticmethod
     def from_hf(model_id: str, **kwargs):

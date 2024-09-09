@@ -207,6 +207,7 @@ class Llama(nn.Module):
         *,
         input_pos: Tensor | None = None,
         prefix_lengths: Tensor | None = None,
+        labels: Tensor | None = None,
     ) -> Tensor:
         if prefix_lengths is not None:
             assert input_pos is None
@@ -227,7 +228,10 @@ class Llama(nn.Module):
             else:
                 x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
 
-        return self.output(self.norm(x))
+        x = self.output(self.norm(x))
+        if labels is not None:
+            x = F.cross_entropy(x.view(-1, x.shape[-1]).float(), labels.view(-1))
+        return x
 
     @staticmethod
     def from_hf(model_id: str, **kwargs):

@@ -78,12 +78,6 @@ def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 25
     return _data_iter(ds["input_ids"], ds["prefix_length"], batch_size, seq_len_multiple), len(ds)
 
 
-def get_loss(model: Llama, inputs: Tensor, labels: Tensor, prefix_lengths: Tensor | None = None):
-    logits = model(inputs, prefix_lengths=prefix_lengths).float().flatten(0, 1)
-    labels = labels.flatten()
-    return F.cross_entropy(logits, labels)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/Llama-3.1-Minitron-4B-Width-Base")
@@ -130,6 +124,8 @@ if __name__ == "__main__":
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
     # TODO: handle quantization/LoRA for LM head separately
+    if args.compile:
+        model.compile()
 
     model.cuda()
     print_model_stats(model)
@@ -155,7 +151,6 @@ if __name__ == "__main__":
     model.train()
     n_toks = 0
     time0 = time.perf_counter()
-    loss_fn = torch.compile(get_loss) if args.compile else get_loss
 
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
@@ -166,7 +161,7 @@ if __name__ == "__main__":
                 inputs = F.pad(inputs, (0, pad))
                 labels = F.pad(labels, (0, pad), value=-100)
 
-            loss = loss_fn(model, inputs, labels, prefix_lengths if args.prefix_lm else None)
+            loss = model(inputs, labels=labels, prefix_lengths=prefix_lengths if args.prefix_lm else None)
             (loss / args.gradient_accumulation).backward()
             n_toks += lengths.sum()
 

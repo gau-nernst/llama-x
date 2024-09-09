@@ -115,10 +115,6 @@ class LibriSpeech(IterableDataset):
                 duration += this_duration
 
 
-def get_loss(model: LlamaAudio, audio: Tensor, tokens: Tensor, labels: Tensor):
-    return F.cross_entropy(model(audio, tokens).flatten(0, 1), labels.flatten())
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
@@ -166,6 +162,8 @@ if __name__ == "__main__":
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
     # TODO: handle quantization/LoRA for LM head separately
+    if args.compile:
+        model.compile()
 
     model.cuda()
     print_model_stats(model)
@@ -204,8 +202,7 @@ if __name__ == "__main__":
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
             audio, tokens, labels = next(dloader)
-            loss_fn = torch.compile(get_loss) if args.compile else get_loss
-            loss = loss_fn(model, audio.cuda(), tokens.cuda(), labels.cuda())
+            loss = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
             (loss / args.gradient_accumulation).backward()
             n_toks += (labels != -100).sum()
 
