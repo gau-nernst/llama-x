@@ -29,7 +29,7 @@ class Int8LinearWeight(Tensor):
     def __init__(self, int_data: Tensor, scale: Tensor, dynamic_int8_act: bool = False):
         assert int_data.dtype is torch.int8
         assert int_data.ndim == 2
-        assert scale.ndim == 2
+        assert scale.ndim == 1
         self.int_data = int_data
         self.scale = scale
         self.dynamic_int8_act = dynamic_int8_act
@@ -50,7 +50,7 @@ class Int8LinearWeight(Tensor):
 
     def __repr__(self):
         return (
-            f"{self.__class__.__name__}(shape={tuple(self.shape)}, config={self.config}, "
+            f"{self.__class__.__name__}(shape={tuple(self.shape)}, dynamic_int8_act={self.dynamic_int8_act}, "
             f"dtype={self.dtype}, device={self.device}, requires_grad={self.requires_grad})"
         )
 
@@ -70,7 +70,7 @@ class Int8LinearWeight(Tensor):
             return cls(
                 func(args[0].int_data, *args[1:], **kwargs),
                 func(args[0].scale, *args[1:], **kwargs),
-                args[0].config,
+                args[0].dynamic_int8_act,
             )
 
         elif func in (aten._to_copy.default,):
@@ -79,7 +79,7 @@ class Int8LinearWeight(Tensor):
             return cls(
                 args[0].int_data.to(device=device),
                 args[0].scale.to(device=device, dtype=dtype),
-                args[0].config,
+                args[0].dynamic_int8_act,
             )
 
         elif func is aten.copy_.default:
@@ -102,7 +102,7 @@ class Int8LinearWeight(Tensor):
 
 class _Int8Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input: Tensor, weight: Int8LinearWeight):
+    def forward(ctx, input: Tensor, weight: Int8LinearWeight, bias: Tensor | None):
         ctx.save_for_backward(weight.int_data, weight.scale)
 
         if weight.dynamic_int8_act:
@@ -114,10 +114,14 @@ class _Int8Linear(torch.autograd.Function):
             # NOTE: we have to .T before .to(input.dtype) for torch.compile() mixed matmul to work
             out = (input @ weight.int_data.T.to(input.dtype)) * weight.scale
 
+        out = out + bias if bias is not None else out
         return out
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         weight_i8, weight_scale = ctx.saved_tensors
+        grad_input = grad_weight = grad_bias = None
         grad_input = (grad_output * weight_scale) @ weight_i8.to(grad_output.dtype)
-        return grad_input, None
+        if ctx.needs_input_grad[2]:
+            grad_bias = grad_output.view(-1, weight_i8.shape[0]).sum(0)
+        return grad_input, grad_weight, grad_bias
