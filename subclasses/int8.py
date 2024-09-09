@@ -107,7 +107,7 @@ class _Int8Linear(torch.autograd.Function):
 
         if weight.dynamic_int8_act:
             input_i8, input_scale = quantize_int8_rowwise(input.view(-1, weight.shape[1]))
-            out = torch._int_mm(input_i8, weight.int_data.T) * input_scale.view(-1, 1) * weight.scale
+            out = torch._int_mm(input_i8, weight.int_data.T) * weight.scale * input_scale.view(-1, 1)
             out = out.view(*input.shape[:-1], -1)
 
         else:
