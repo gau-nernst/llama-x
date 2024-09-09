@@ -4,7 +4,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +21,10 @@ from tokenizers import Llama3Tokenizer
 from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
 
 
+def next_multiple(x: int, n: int) -> int:
+    return (x + n - 1) // n * n
+
+
 def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_size: int, seq_len_multiple: int = 256):
     n = len(tokens_list)
 
@@ -34,15 +37,15 @@ def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_s
         for i in range(0, n - batch_size + 1, batch_size):
             tokens_batch = tokens_list[i : i + batch_size]
             prefix_length_batch = prefix_length_list[i : i + batch_size]
-            max_length = max(math.ceil(x.shape[0] / seq_len_multiple) * seq_len_multiple for x in tokens_batch)
+            max_length = max(next_multiple(x.shape[0] - 1, seq_len_multiple) for x in tokens_batch)
 
             inputs = torch.zeros(batch_size, max_length, dtype=torch.int64)
             labels = torch.full((batch_size, max_length), -100, dtype=torch.int64)
             lengths = torch.empty(batch_size, dtype=torch.int64)
             for _i, tokens in enumerate(tokens_batch):
-                n_toks = tokens.shape[0]
-                inputs[_i, :n_toks] = tokens
-                labels[_i, :n_toks] = tokens
+                n_toks = tokens.shape[0] - 1
+                inputs[_i, :n_toks] = tokens[:-1]
+                labels[_i, :n_toks] = tokens[1:]
                 lengths[_i] = n_toks
 
             yield inputs.cuda(), labels.cuda(), lengths, prefix_length_batch.cuda()
@@ -66,7 +69,7 @@ def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 25
         prompt_tokens = tokenizer(prompt, add_bos=True)
         answer_tokens = tokenizer(answer, add_eos=True)
         return dict(
-            input_ids=(prompt_tokens + answer_tokens)[:max_seq_len],
+            input_ids=(prompt_tokens + answer_tokens)[: max_seq_len + 1],
             prefix_length=len(prompt_tokens),
         )
 
@@ -76,8 +79,8 @@ def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 25
 
 
 def get_loss(model: Llama, inputs: Tensor, labels: Tensor, prefix_lengths: Tensor | None = None):
-    logits = model(inputs, prefix_lengths=prefix_lengths)[:, :-1].flatten(0, 1)
-    labels = labels[:, 1:].flatten()
+    logits = model(inputs, prefix_lengths=prefix_lengths).float().flatten(0, 1)
+    labels = labels.flatten()
     return F.cross_entropy(logits, labels)
 
 
