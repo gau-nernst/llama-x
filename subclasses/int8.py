@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .int8_mm import int8_mm_dequant
+
 aten = torch.ops.aten
 
 
@@ -42,8 +44,8 @@ class Int8LinearWeight(Tensor):
         return cls(tensor_data_dict["int_data"], tensor_data_dict["scale"], *tensor_attributes)
 
     @classmethod
-    def from_float(cls, tensor: Tensor, int8_mm_forward: bool = False):
-        return cls(*quantize_int8_rowwise(tensor), int8_mm_forward)
+    def from_float(cls, tensor: Tensor, dynamic_int8_act: bool = False):
+        return cls(*quantize_int8_rowwise(tensor), dynamic_int8_act)
 
     def dequantize(self):
         return self.int_data * self.scale.view(-1, 1)
@@ -107,7 +109,7 @@ class _Int8Linear(torch.autograd.Function):
 
         if weight.dynamic_int8_act:
             input_i8, input_scale = quantize_int8_rowwise(input.view(-1, weight.shape[1]))
-            out = torch._int_mm(input_i8, weight.int_data.T) * weight.scale * input_scale.view(-1, 1)
+            out = int8_mm_dequant(input_i8, weight.int_data.T, input_scale, weight.scale)
             out = out.view(*input.shape[:-1], -1)
 
         else:

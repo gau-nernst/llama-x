@@ -148,7 +148,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume")
     parser.add_argument("--ckpt_interval", type=int, default=1000)
     parser.add_argument("--project")
-    parser.add_argument("--run_name", default="debug")
+    parser.add_argument("--run_name")
     parser.add_argument("--seed", type=int)
     args = parser.parse_args()
 
