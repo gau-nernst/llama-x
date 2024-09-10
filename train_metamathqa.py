@@ -11,13 +11,14 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import wandb
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from torch import Tensor
+from torchao.prototype import low_bit_optim
 from tqdm import tqdm
 
+from llama_tokenizers import get_tokenizer
 from modelling import Llama, apply_linear_adapter_
 from subclasses import quantize_linear_
-from tokenizers import get_tokenizer
 from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
 
 
@@ -59,25 +60,32 @@ def get_metamathqa(tokenizer_name: str, batch_size: int, max_seq_len: int, seq_l
     # Llama2    | 2982 | 1178  | 751
     # Llama3    | 2318 | 1089  | 678
 
-    tokenizer = get_tokenizer(tokenizer_name)
+    ds_path = f"metamathqa_{tokenizer_name}"
+    if Path(ds_path).exists():
+        ds = load_from_disk(ds_path)
 
-    def apply_template(example):
-        prompt = (
-            "Below is an instruction that describes a task. "
-            "Write a response that appropriately completes the request.\n\n"
-            "### Instruction:\n{query}\n\n"
-            "### Response: Let's think step by step."
-        ).format(query=example["query"])
-        answer = " {response}".format(response=example["response"])
-        prompt_tokens = tokenizer(prompt, add_bos=True)
-        answer_tokens = tokenizer(answer, add_eos=True)
-        return dict(
-            input_ids=(prompt_tokens + answer_tokens)[: max_seq_len + 1],
-            prefix_length=len(prompt_tokens),
-        )
+    else:
+        tokenizer = get_tokenizer(tokenizer_name)
 
-    ds = load_dataset("meta-math/MetaMathQA", split="train").with_format("torch")
-    ds = ds.map(apply_template, remove_columns=ds.features)
+        def apply_template(example):
+            prompt = (
+                "Below is an instruction that describes a task. "
+                "Write a response that appropriately completes the request.\n\n"
+                "### Instruction:\n{query}\n\n"
+                "### Response: Let's think step by step."
+            ).format(query=example["query"])
+            answer = " {response}".format(response=example["response"])
+            prompt_tokens = tokenizer(prompt, add_bos=True)
+            answer_tokens = tokenizer(answer, add_eos=True)
+            return dict(
+                input_ids=(prompt_tokens + answer_tokens)[: max_seq_len + 1],
+                prefix_length=len(prompt_tokens),
+            )
+
+        ds = load_dataset("meta-math/MetaMathQA", split="train").with_format("torch")
+        ds = ds.map(apply_template, remove_columns=ds.features)
+        ds.save_to_disk(ds_path)
+
     return _data_iter(ds["input_ids"], ds["prefix_length"], batch_size, seq_len_multiple), len(ds)
 
 
@@ -101,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
 
+    parser.add_argument("--optim", default="AdamW")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--warmup", type=float, default=0.0)
@@ -135,7 +144,12 @@ if __name__ == "__main__":
     print_model_stats(model)
     print(model)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+    optim_cls = dict(
+        AdamW=torch.optim.AdamW,
+        AdamW8bit=low_bit_optim.AdamW8bit,
+        AdamW4bit=low_bit_optim.AdamW4bit,
+    )[args.optim]
+    optim = optim_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
     train_data_iter, train_size = get_metamathqa(
