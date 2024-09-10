@@ -4,6 +4,13 @@ from huggingface_hub import hf_hub_download
 from tiktoken.load import load_tiktoken_bpe
 
 
+def get_tokenizer(name: str):
+    return dict(
+        llama2=Llama2Tokenizer,
+        llama3=Llama3Tokenizer,
+    )[name]()
+
+
 class Llama2Tokenizer:
     bos_id = 1
     eos_id = 2

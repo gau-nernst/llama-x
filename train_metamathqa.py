@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from modelling import Llama, apply_linear_adapter_
 from subclasses import quantize_linear_
-from tokenizers import Llama3Tokenizer
+from tokenizers import get_tokenizer
 from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
 
 
@@ -51,12 +51,15 @@ def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_s
             yield inputs.cuda(), labels.cuda(), lengths, prefix_length_batch.cuda()
 
 
-def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 256):
-    # using Llama3 tokenizer, seq len stats
-    # - P99: 678
-    # - P99.9: 1089
-    # - max: 2318
-    tokenizer = Llama3Tokenizer()
+def get_metamathqa(tokenizer_name: str, batch_size: int, max_seq_len: int, seq_len_multiple: int = 256):
+    # sequence length stats
+    #
+    # tokenizer | max  | P99.9 | P99
+    # ----------|------|-------|-----
+    # Llama2    | 2982 | 1178  | 751
+    # Llama3    | 2318 | 1089  | 678
+
+    tokenizer = get_tokenizer(tokenizer_name)
 
     def apply_template(example):
         prompt = (
@@ -80,7 +83,8 @@ def get_metamathqa(batch_size: int, max_seq_len: int, seq_len_multiple: int = 25
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="nvidia/Llama-3.1-Minitron-4B-Width-Base")
+    parser.add_argument("--model", default="TinyLlama/TinyLlama_v1.1")
+    parser.add_argument("--tokenizer", default="llama2")
     parser.add_argument("--adapter")
     parser.add_argument("--adapter_kwargs", type=json.loads, default=dict())
     parser.add_argument("--quantize")
@@ -119,7 +123,7 @@ if __name__ == "__main__":
         args.model,
         max_seq_len=args.max_seq_len,
         activation_checkpointing=args.activation_checkpointing,
-    )
+    ).bfloat16()
     freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
@@ -135,6 +139,7 @@ if __name__ == "__main__":
     lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
     train_data_iter, train_size = get_metamathqa(
+        args.tokenizer,
         args.batch_size // args.gradient_accumulation,
         args.max_seq_len,
         seq_len_multiple=args.seq_len_multiple,
@@ -142,8 +147,8 @@ if __name__ == "__main__":
     print(f"Training dataset size: {train_size:,}")
     print(f"Each epoch will takes {train_size // args.batch_size:,} iters to finish")
 
-    save_dir = Path("runs/metamathqa") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    save_dir.mkdir(parents=True, exist_ok=True)
+    args.save_dir = Path("runs/metamathqa") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    args.save_dir.mkdir(parents=True, exist_ok=True)
     run = wandb.init(project=args.project, name=args.run_name, config=args, dir="/tmp")
 
     step = 0
@@ -202,6 +207,6 @@ if __name__ == "__main__":
                 model=model.state_dict(),
                 optim=optim.state_dict(),
             )
-            torch.save(ckpt, save_dir / "last.pth")
+            torch.save(ckpt, args.save_dir / "last.pth")
 
     run.finish()

@@ -259,8 +259,9 @@ def _get_hf_config(model_id: str):
         num_kv_heads=hf_config["num_key_value_heads"],
         intermediate_dim=hf_config["intermediate_size"],
         vocab_size=hf_config["vocab_size"],
-        rope_base=hf_config["rope_theta"],
     )
+    if "rope_theta" in hf_config:
+        config = config._replace(rope_base=hf_config["rope_theta"])
     # TODO: may need more rigorous check
     if hf_config.get("rope_scaling", None) is not None:
         config = config._replace(is_llama3_1=hf_config["rope_scaling"]["rope_type"] == "llama3")
@@ -285,11 +286,22 @@ def _rename_hf_key(key: str):
 
 
 def _get_hf_state_dict(model_id: str):
-    filenames = [x for x in list_repo_files(model_id) if x.endswith(".safetensors")]
+    for ext in (".safetensors", ".bin"):
+        filenames = [x for x in list_repo_files(model_id) if x.endswith(ext)]
+        if filenames:
+            break
+
+    if not filenames:
+        raise RuntimeError(f"No weights found for {model_id=}")
+
     state_dict = dict()
     for filename in filenames:
         filepath = hf_hub_download(model_id, filename)
-        with safetensors.safe_open(filepath, framework="pt") as f:
-            for k in f.keys():
-                state_dict[_rename_hf_key(k)] = f.get_tensor(k)
+        if filepath.endswith(".safetensors"):
+            with safetensors.safe_open(filepath, framework="pt") as f:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+        else:
+            state_dict.update(torch.load(filepath, map_location="cpu", weights_only=True, mmap=True))
+    state_dict = {_rename_hf_key(k): v for k, v in state_dict.items()}
     return state_dict
