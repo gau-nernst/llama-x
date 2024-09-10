@@ -121,12 +121,15 @@ if __name__ == "__main__":
     parser.add_argument("--project")
     parser.add_argument("--run_name")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
     args.torch_version = torch.__version__
     assert args.batch_size % args.gradient_accumulation == 0
     if args.seed is not None:
         torch.manual_seed(args.seed)
+    if args.profile:
+        args.n_steps = 10
 
     model = Llama.from_hf(
         args.model,
@@ -171,6 +174,13 @@ if __name__ == "__main__":
     n_toks = 0
     time0 = time.perf_counter()
 
+    if args.profile:
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=1, warmup=4, active=2, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("tb_logs"),
+        )
+        prof.start()
+
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
             inputs, labels, lengths, prefix_lengths = next(train_data_iter)
@@ -180,13 +190,16 @@ if __name__ == "__main__":
                 inputs = F.pad(inputs, (0, pad))
                 labels = F.pad(labels, (0, pad), value=-100)
 
-            loss = model(inputs, labels=labels, prefix_lengths=prefix_lengths if args.prefix_lm else None)
+            loss = model(inputs, labels=labels)
             (loss / args.gradient_accumulation).backward()
             n_toks += lengths.sum()
 
         lr = lr_schedule.get_lr(step)
         for param_group in optim.param_groups:
-            param_group["lr"] = lr
+            if isinstance(param_group["lr"], Tensor):
+                param_group["lr"].fill_(lr)
+            else:
+                param_group["lr"] = lr
 
         if args.clip_grad_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
@@ -222,5 +235,11 @@ if __name__ == "__main__":
                 optim=optim.state_dict(),
             )
             torch.save(ckpt, args.save_dir / "last.pth")
+
+        if args.profile:
+            prof.step()
+
+    if args.profile:
+        prof.stop()
 
     run.finish()

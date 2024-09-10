@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, list_repo_files
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -193,31 +193,16 @@ class Llama(nn.Module):
             L = self.config.max_seq_len
             self.register_buffer("causal_mask", torch.tril(torch.ones(L, L, dtype=torch.bool)), persistent=False)
 
-    @torch._dynamo.disable
-    def build_block_mask(self, x: Tensor, prefix_lengths: Tensor):
-        def prefix_mask(b, h, q_idx, kv_idx):
-            return (kv_idx <= prefix_lengths[b]) | (q_idx >= kv_idx)
-
-        B, L = x.shape
-        return create_block_mask(prefix_mask, B, self.config.num_heads, L, L)
-
     def forward(
         self,
         x: Tensor,
         *,
         input_pos: Tensor | None = None,
-        prefix_lengths: Tensor | None = None,
+        block_mask: Tensor | None = None,
         labels: Tensor | None = None,
     ) -> Tensor:
-        if prefix_lengths is not None:
-            assert input_pos is None
-            block_mask = self.build_block_mask(x, prefix_lengths)
-        else:
-            block_mask = None
-
         # this is used for inference i.e. generate
         mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
-
         x = self.tok_embeddings(x)
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:
