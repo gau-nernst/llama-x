@@ -1,12 +1,13 @@
 # please download LibriSpeech from here: https://www.openslr.org/12
 #
 # some statistics
-# split           | duration max | duration P99.9 | duration P99
-# ----------------|--------------|----------------|--------------
-# train-clean-100 | 24.5         | 17.1           | 16.7
-# train-clean-360 | 29.7         | 17.1           | 16.7
-# dev-clean       | 32.6         | 32.3           | 23.8
-# test-clean      | 35.0         | 32.8           | 25.5
+# split           |    audio duration    |    llama2 tokens   |
+#                 | max   | P99.9 | P99  | max  | P99.9 | P99 |
+# ----------------|-------|-------|------|------|-------|-----|
+# train-clean-100 | 24.5  | 17.1  | 16.7 |  91  |  78   | 69  |
+# train-clean-360 | 29.7  | 17.1  | 16.7 | 110  |  78   | 69  |
+# dev-clean       | 32.6  | 32.3  | 23.8 | 133  | 116   | 84  |
+# test-clean      | 35.0  | 32.8  | 25.5 | 130  | 104   | 82  |
 
 import os
 
@@ -55,10 +56,9 @@ class LibriSpeech(IterableDataset):
         for file in self.data_dir.glob("**/*.trans.txt"):
             for line in open(file):
                 audio_fname, text = line.rstrip().split(" ", 1)
-
-            audio_path = str((file.parent / f"{audio_fname}.flac").relative_to(self.data_dir))
-            tokens = _tokenizer(f" {text.lower()}.")
-            self.samples.append((audio_path, tokens))
+                audio_path = str((file.parent / f"{audio_fname}.flac").relative_to(self.data_dir))
+                tokens = _tokenizer(f" {text.lower()}.")
+                self.samples.append((audio_path, tokens))
 
         self.samples.sort()
         self.bos_id = _tokenizer.bos_id
