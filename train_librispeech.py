@@ -15,7 +15,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -34,95 +33,77 @@ from subclasses import quantize_linear_
 from train_utils import LRScheduler, freeze_params, get_grad_norm, get_optimizer_class, print_model_stats
 
 
+def next_multiple(x: int, n: int) -> int:
+    return (x + n - 1) // n * n
+
+
+def pad_to_multiple(data_list: list[Tensor], multiple: int, fill_value: int = 0):
+    max_length = max(x.shape[0] for x in data_list)
+    target_length = next_multiple(max_length, multiple)
+    padded_data = [F.pad(x, (0, target_length - x.shape[0]), value=fill_value) for x in data_list]
+    return torch.stack(padded_data, dim=0)
+
+
 class LibriSpeech(IterableDataset):
     def __init__(
         self,
         data_dir: str,
-        tokenizer: str,
-        audio_duration: float,
-        seq_len_multiple: int,
+        tokenizer_name: str,
+        audio_duration_multiple: float,
+        text_len_multiple: int,
         batch_size: int,
         audio_config: AudioConfig = AudioConfig(),
     ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
-        self.audio_duration = audio_duration
-        self.seq_len_multiple = seq_len_multiple
+        self.audio_len_multiple = int(audio_duration_multiple * audio_config.sample_rate)
+        self.text_len_multiple = text_len_multiple
         self.batch_size = batch_size
         self.audio_config = audio_config
 
-        _tokenizer = get_tokenizer(tokenizer)
+        tokenizer = get_tokenizer(tokenizer_name)
         self.samples = []
         for file in self.data_dir.glob("**/*.trans.txt"):
             for line in open(file):
                 audio_fname, text = line.rstrip().split(" ", 1)
                 audio_path = str((file.parent / f"{audio_fname}.flac").relative_to(self.data_dir))
-                tokens = _tokenizer(f" {text.lower()}.")
-                self.samples.append((audio_path, tokens))
-
+                # the extra space is needed for Llama3 tokenizer, but not for Llama2 tokenizer
+                tokens = tokenizer(f" {text.lower()}.", add_bos=True, add_eos=True)
+                self.samples.append((audio_path, torch.tensor(tokens, dtype=torch.int64)))
         self.samples.sort()
-        self.bos_id = _tokenizer.bos_id
-        self.eos_id = _tokenizer.eos_id
-        self.pad_id = _tokenizer.pad_id
-
-    def _prepare_batch(self, batch: list[tuple[Tensor, Tensor]]):
-        audio_batch, _tokens_batch = zip(*batch)
-        batch_audio_duration = sum(x.shape[0] for x in audio_batch) / self.audio_config.sample_rate
-
-        audio_length = int(self.audio_duration * self.audio_config.sample_rate)
-        audio_batch = [F.pad(x, (0, audio_length - x.shape[0])) for x in audio_batch]
-        audio_batch = torch.stack(audio_batch, dim=0)
-
-        tokens_length = math.ceil(max(len(x) for x in _tokens_batch) / self.seq_len_multiple) * self.seq_len_multiple
-        tokens_batch = []
-        labels_batch = []
-        for tokens in _tokens_batch:
-            pad = tokens_length - len(tokens)
-            tokens_batch.append(tokens + [self.pad_id] * pad)
-            labels_batch.append(tokens[1:] + [-100] * (pad + 1))
-
-        tokens_batch = torch.tensor(tokens_batch)
-        labels_batch = torch.tensor(labels_batch)
-
-        return audio_batch, tokens_batch, labels_batch, batch_audio_duration
 
     def __iter__(self):
-        batch = []
-        audio = []
-        tokens = [self.bos_id]
-        duration = 0
+        epoch_idx = 0
+        samples = self.samples
+        n = len(samples)
 
         while True:
             # NOTE: we don't partition the data. just shuffle it with different seeds across workers
-            # re-think this...
-            for idx in torch.randperm(len(self.samples)):
-                # pack samples until we reach seq_len
-                this_audio_path, this_tokens = self.samples[idx]
-                this_audio, fs = torchaudio.load(self.data_dir / this_audio_path)
-                assert fs == self.audio_config.sample_rate
-                this_audio = this_audio.mean(0)
+            indices = torch.randperm(n)
+            samples = [samples[idx] for idx in indices]
 
-                # TODO: think about how to handle this better
-                this_duration = this_audio.shape[0] / fs
-                if this_duration > self.audio_duration:
-                    continue
+            for i in range(0, n - self.batch_size + 1, self.batch_size):
+                duration = 0
+                n_toks = 0
+                audio_batch = []
+                tokens_batch = []
+                labels_batch = []
+                for filename, tokens in samples[i : i + self.batch_size]:
+                    audio, fs = torchaudio.load(self.data_dir / filename)
+                    assert fs == self.audio_config.sample_rate
+                    audio = audio.mean(0)
+                    duration += audio.shape[0] / fs
+                    n_toks += len(tokens) - 1
+                    audio_batch.append(audio)
+                    tokens_batch.append(tokens[:-1])
+                    labels_batch.append(tokens[1:])
 
-                if duration + this_duration > self.audio_duration:
-                    audio = torch.cat(audio, dim=0)
-                    tokens.append(self.eos_id)
+                audio_batch = pad_to_multiple(audio_batch, self.audio_len_multiple)
+                tokens_batch = pad_to_multiple(tokens_batch, self.text_len_multiple)
+                labels_batch = pad_to_multiple(labels_batch, self.text_len_multiple, fill_value=-100)
+                yield audio_batch, tokens_batch, labels_batch, duration, n_toks
 
-                    batch.append((audio, tokens))
-                    if len(batch) == self.batch_size:
-                        yield self._prepare_batch(batch)
-                        batch = []
-
-                    audio = []
-                    tokens = [self.bos_id]
-                    duration = 0
-
-                audio.append(this_audio)
-                tokens.extend(this_tokens)
-                duration += this_duration
+            epoch_idx += 1
 
 
 if __name__ == "__main__":
@@ -138,8 +119,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile", action="store_true")
 
     parser.add_argument("--dataset_dir", required=True)
-    parser.add_argument("--audio_duration", type=float, default=40)
-    parser.add_argument("--seq_len_multiple", type=int, default=128)
+    parser.add_argument("--audio_duration_multiple", type=float, default=8.0)
+    parser.add_argument("--text_len_multiple", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--n_workers", type=int, default=4)
@@ -183,15 +164,15 @@ if __name__ == "__main__":
     ds = LibriSpeech(
         args.dataset_dir,
         args.tokenizer,
-        args.audio_duration,
-        args.seq_len_multiple,
+        args.audio_duration_multiple,
+        args.text_len_multiple,
         args.batch_size // args.gradient_accumulation,
         model.audio_config,
     )
     dloader = iter(DataLoader(ds, batch_size=None, num_workers=args.n_workers, pin_memory=True))
 
-    save_dir = Path("runs/librispeech") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    save_dir.mkdir(parents=True, exist_ok=True)
+    args.save_dir = Path("runs/librispeech") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    args.save_dir.mkdir(parents=True, exist_ok=True)
     run = wandb.init(project=args.project, name=args.run_name, config=args, dir="/tmp")
 
     step = 0
@@ -211,11 +192,11 @@ if __name__ == "__main__":
 
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
-            audio, tokens, labels, batch_audio_duration = next(dloader)
+            audio, tokens, labels, audio_secs_batch, n_toks_batch = next(dloader)
             loss = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
             (loss / args.gradient_accumulation).backward()
-            n_toks += (labels != -100).sum()
-            audio_secs += batch_audio_duration
+            audio_secs += audio_secs_batch
+            n_toks += n_toks_batch
 
         lr_schedule.set_lr(optim, step)
 
@@ -254,6 +235,6 @@ if __name__ == "__main__":
                 model=model.state_dict(),
                 optim=optim.state_dict(),
             )
-            torch.save(ckpt, save_dir / "last.pth")
+            torch.save(ckpt, args.save_dir / "last.pth")
 
     run.finish()
