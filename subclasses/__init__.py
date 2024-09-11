@@ -9,7 +9,7 @@ from torchao.prototype.quantized_training import (
 from .int8 import Int8LinearWeight
 
 
-def quantize_linear_(model: nn.Module, quantize: str | None, **kwargs):
+def quantize_linear_(model: nn.Module, quantize: str | None, requires_grad: bool = False, **kwargs):
     if quantize is None:
         return
 
@@ -19,4 +19,4 @@ def quantize_linear_(model: nn.Module, quantize: str | None, **kwargs):
     )[quantize]
     for m in model.modules():
         if isinstance(m, nn.Linear):
-            m.weight = nn.Parameter(fn(m.weight.detach(), **kwargs), requires_grad=False)
+            m.weight = nn.Parameter(fn(m.weight.detach(), **kwargs), requires_grad=requires_grad)

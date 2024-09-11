@@ -204,6 +204,7 @@ if __name__ == "__main__":
     pbar = tqdm(total=args.n_steps, dynamic_ncols=True)
     model.train()
     n_toks = 0
+    n_toks_seen = 0
     time0 = time.perf_counter()
 
     if args.profile:
@@ -241,11 +242,6 @@ if __name__ == "__main__":
                 max_memory_allocated=torch.cuda.max_memory_allocated() / 1e9,
                 max_memory_reserved=torch.cuda.max_memory_reserved() / 1e9,
             )
-            if step > 0:
-                time1 = time.perf_counter()
-                log_dict["toks_per_second"] = n_toks / (time1 - time0)
-                n_toks = 0
-                time0 = time1
             run.log(log_dict, step=step)
             pbar.set_postfix(loss=log_dict["loss"])
 
@@ -254,6 +250,17 @@ if __name__ == "__main__":
 
         step += 1
         pbar.update()
+
+        if step % args.log_interval == 0:
+            time1 = time.perf_counter()
+            n_toks_seen += n_toks
+            log_dict = dict(
+                toks_per_second=n_toks / (time1 - time0),
+                num_toks_seen_millions=n_toks_seen / 1e6,
+            )
+            run.log(log_dict, step=step)
+            n_toks = 0
+            time0 = time1
 
         if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
             ckpt = dict(
