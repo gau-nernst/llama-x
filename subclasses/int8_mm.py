@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-lib = torch.library.Library("torchao", "FRAGMENT")
+lib = torch.library.Library("llama_x", "FRAGMENT")
 
 
 # TODO: prune configs to speedup triton autotune
@@ -129,7 +129,7 @@ def int8_mm_dequant(A: Tensor, B: Tensor, A_scale_rowwise: Tensor, B_scale_colwi
     assert B_scale_colwise.squeeze().shape == (B.shape[1],)
     assert A_scale_rowwise.is_contiguous()
     assert B_scale_colwise.is_contiguous()
-    return torch.ops.torchao.int8_mm_dequant(A, B, A_scale_rowwise, B_scale_colwise)
+    return getattr(torch.ops, lib.ns).int8_mm_dequant(A, B, A_scale_rowwise, B_scale_colwise)
 
 
 @torch.library.impl(lib, "int8_mm_dequant", "Meta")
