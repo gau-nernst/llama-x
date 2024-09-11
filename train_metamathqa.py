@@ -14,13 +14,12 @@ import wandb
 from datasets import load_dataset, load_from_disk
 from torch import Tensor
 from torch.nn.attention.flex_attention import create_block_mask
-from torchao.prototype import low_bit_optim
 from tqdm import tqdm
 
 from llama_tokenizers import get_tokenizer
 from modelling import Llama, apply_linear_adapter_
 from subclasses import quantize_linear_
-from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
+from train_utils import LRScheduler, freeze_params, get_grad_norm, get_optimizer_class, print_model_stats
 
 
 def next_multiple(x: int, n: int) -> int:
@@ -136,7 +135,6 @@ if __name__ == "__main__":
     parser.add_argument("--adapter_kwargs", type=json.loads, default=dict())
     parser.add_argument("--quantize")
     parser.add_argument("--quantize_kwargs", type=json.loads, default=dict())
-    parser.add_argument("--prefix_lm", action="store_true")
     parser.add_argument("--freeze_prefixes", nargs="+", default=[])
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
@@ -187,12 +185,7 @@ if __name__ == "__main__":
     print_model_stats(model)
     print(model)
 
-    optim_cls = dict(
-        AdamW=torch.optim.AdamW,
-        AdamW8bit=low_bit_optim.AdamW8bit,
-        AdamW4bit=low_bit_optim.AdamW4bit,
-    )[args.optim]
-    optim = optim_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+    optim = get_optimizer_class(args.optim)(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
     train_data_iter, train_size = get_metamathqa(
@@ -234,12 +227,7 @@ if __name__ == "__main__":
             (loss / args.gradient_accumulation).backward()
             n_toks += (labels != -100).sum()
 
-        lr = lr_schedule.get_lr(step)
-        for param_group in optim.param_groups:
-            if isinstance(param_group["lr"], Tensor):
-                param_group["lr"].fill_(lr)
-            else:
-                param_group["lr"] = lr
+        lr_schedule.set_lr(optim, step)
 
         if args.clip_grad_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)

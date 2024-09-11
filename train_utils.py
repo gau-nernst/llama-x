@@ -1,4 +1,6 @@
-from torch import nn
+import torch
+from torch import Tensor, nn
+from torchao.prototype import low_bit_optim
 
 
 def freeze_params(model: nn.Module, prefixes: list[str]):
@@ -13,6 +15,14 @@ def freeze_params(model: nn.Module, prefixes: list[str]):
         print("Freeze the following parameters:")
         for name in frozen_names:
             print(f"  - {name}")
+
+
+def get_optimizer_class(optim: str):
+    return dict(
+        AdamW=torch.optim.AdamW,
+        AdamW8bit=low_bit_optim.AdamW8bit,
+        AdamW4bit=low_bit_optim.AdamW4bit,
+    )[optim]
 
 
 def get_grad_norm(model: nn.Module):
@@ -46,3 +56,11 @@ class LRScheduler:
         if step < self.t3:
             return self.lr * (self.t3 - step) / (self.t3 - self.t2)
         return self.lr
+
+    def set_lr(self, optim: torch.optim.Optimizer, step: int):
+        lr = self.get_lr(step)
+        for param_group in optim.param_groups:
+            if isinstance(param_group["lr"], Tensor):
+                param_group["lr"].fill_(lr)
+            else:
+                param_group["lr"] = lr
