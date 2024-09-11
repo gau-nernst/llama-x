@@ -67,6 +67,7 @@ class LibriSpeech(IterableDataset):
 
     def _prepare_batch(self, batch: list[tuple[Tensor, Tensor]]):
         audio_batch, _tokens_batch = zip(*batch)
+        batch_audio_duration = sum(x.shape[0] for x in audio_batch) / self.audio_config.sample_rate
 
         audio_length = int(self.audio_duration * self.audio_config.sample_rate)
         audio_batch = [F.pad(x, (0, audio_length - x.shape[0])) for x in audio_batch]
@@ -83,7 +84,7 @@ class LibriSpeech(IterableDataset):
         tokens_batch = torch.tensor(tokens_batch)
         labels_batch = torch.tensor(labels_batch)
 
-        return audio_batch, tokens_batch, labels_batch
+        return audio_batch, tokens_batch, labels_batch, batch_audio_duration
 
     def __iter__(self):
         batch = []
@@ -205,14 +206,16 @@ if __name__ == "__main__":
     pbar = tqdm(initial=step, total=args.n_steps, dynamic_ncols=True)
     model.train()
     n_toks = 0
+    audio_secs = 0
     time0 = time.perf_counter()
 
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
-            audio, tokens, labels = next(dloader)
+            audio, tokens, labels, batch_audio_duration = next(dloader)
             loss = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
             (loss / args.gradient_accumulation).backward()
             n_toks += (labels != -100).sum()
+            audio_secs += batch_audio_duration
 
         lr_schedule.set_lr(optim, step)
 
@@ -232,8 +235,9 @@ if __name__ == "__main__":
             if step > 0:
                 time1 = time.perf_counter()
                 log_dict["toks_per_second"] = n_toks / (time1 - time0)
-                log_dict["audio_secs_per_second"] = (args.audio_duration * args.batch_size) / (time1 - time0)
+                log_dict["audio_secs_per_second"] = audio_secs / (time1 - time0)
                 n_toks = 0
+                audio_secs = 0
                 time0 = time1
             run.log(log_dict, step=step)
             pbar.set_postfix(loss=log_dict["loss"])
