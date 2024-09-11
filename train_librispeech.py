@@ -1,4 +1,12 @@
 # please download LibriSpeech from here: https://www.openslr.org/12
+#
+# some statistics
+# split           | duration max | duration P99.9 | duration P99
+# ----------------|--------------|----------------|--------------
+# train-clean-100 | 24.5         | 17.1           | 16.7
+# train-clean-360 | 29.7         | 17.1           | 16.7
+# dev-clean       | 32.6         | 32.3           | 23.8
+# test-clean      | 35.0         | 32.8           | 25.5
 
 import os
 
@@ -19,10 +27,10 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 
+from llama_tokenizers import get_tokenizer
 from modelling import AudioConfig, LlamaAudio, apply_linear_adapter_
 from subclasses import quantize_linear_
-from tokenizers import Llama2Tokenizer, Llama3Tokenizer
-from train_utils import LRScheduler, freeze_params, get_grad_norm, print_model_stats
+from train_utils import LRScheduler, freeze_params, get_grad_norm, get_optimizer_class, print_model_stats
 
 
 class LibriSpeech(IterableDataset):
@@ -42,7 +50,7 @@ class LibriSpeech(IterableDataset):
         self.batch_size = batch_size
         self.audio_config = audio_config
 
-        _tokenizer = dict(llama2=Llama2Tokenizer, llama3=Llama3Tokenizer)[tokenizer]()
+        _tokenizer = get_tokenizer(tokenizer)
         self.samples = []
         for file in self.data_dir.glob("**/*.trans.txt"):
             for line in open(file):
@@ -85,6 +93,7 @@ class LibriSpeech(IterableDataset):
 
         while True:
             # NOTE: we don't partition the data. just shuffle it with different seeds across workers
+            # re-think this...
             for idx in torch.randperm(len(self.samples)):
                 # pack samples until we reach seq_len
                 this_audio_path, this_tokens = self.samples[idx]
@@ -117,16 +126,16 @@ class LibriSpeech(IterableDataset):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--model", default="TinyLlama/TinyLlama_v1.1")
+    parser.add_argument("--tokenizer", default="llama2")
     parser.add_argument("--adapter")
     parser.add_argument("--adapter_kwargs", type=json.loads, default=dict())
     parser.add_argument("--quantize")
     parser.add_argument("--quantize_kwargs", type=json.loads, default=dict())
+    parser.add_argument("--freeze_prefixes", nargs="+", default=[])
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--lora", type=int)
 
-    parser.add_argument("--tokenizer", default="llama3")
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--audio_duration", type=float, default=40)
     parser.add_argument("--seq_len_multiple", type=int, default=128)
@@ -135,6 +144,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_workers", type=int, default=4)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
 
+    parser.add_argument("--optim", default="AdamW")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--warmup", type=float, default=0.0)
@@ -168,7 +178,7 @@ if __name__ == "__main__":
     model.cuda()
     print_model_stats(model)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+    optim = get_optimizer_class(args.optim)(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     lr_schedule = LRScheduler(args.lr, args.n_steps, args.warmup, args.decay)
 
     ds = LibriSpeech(
@@ -206,9 +216,7 @@ if __name__ == "__main__":
             (loss / args.gradient_accumulation).backward()
             n_toks += (labels != -100).sum()
 
-        lr = lr_schedule.get_lr(step)
-        for param_group in optim.param_groups:
-            param_group["lr"] = lr
+        lr_schedule.set_lr(optim, step)
 
         if args.clip_grad_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)

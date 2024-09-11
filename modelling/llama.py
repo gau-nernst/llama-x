@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, list_repo_files
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -193,31 +193,16 @@ class Llama(nn.Module):
             L = self.config.max_seq_len
             self.register_buffer("causal_mask", torch.tril(torch.ones(L, L, dtype=torch.bool)), persistent=False)
 
-    @torch._dynamo.disable
-    def build_block_mask(self, x: Tensor, prefix_lengths: Tensor):
-        def prefix_mask(b, h, q_idx, kv_idx):
-            return (kv_idx <= prefix_lengths[b]) | (q_idx >= kv_idx)
-
-        B, L = x.shape
-        return create_block_mask(prefix_mask, B, self.config.num_heads, L, L)
-
     def forward(
         self,
         x: Tensor,
         *,
         input_pos: Tensor | None = None,
-        prefix_lengths: Tensor | None = None,
+        block_mask: Tensor | None = None,
         labels: Tensor | None = None,
     ) -> Tensor:
-        if prefix_lengths is not None:
-            assert input_pos is None
-            block_mask = self.build_block_mask(x, prefix_lengths)
-        else:
-            block_mask = None
-
         # this is used for inference i.e. generate
         mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
-
         x = self.tok_embeddings(x)
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:
@@ -259,8 +244,9 @@ def _get_hf_config(model_id: str):
         num_kv_heads=hf_config["num_key_value_heads"],
         intermediate_dim=hf_config["intermediate_size"],
         vocab_size=hf_config["vocab_size"],
-        rope_base=hf_config["rope_theta"],
     )
+    if "rope_theta" in hf_config:
+        config = config._replace(rope_base=hf_config["rope_theta"])
     # TODO: may need more rigorous check
     if hf_config.get("rope_scaling", None) is not None:
         config = config._replace(is_llama3_1=hf_config["rope_scaling"]["rope_type"] == "llama3")
@@ -285,11 +271,22 @@ def _rename_hf_key(key: str):
 
 
 def _get_hf_state_dict(model_id: str):
-    filenames = [x for x in list_repo_files(model_id) if x.endswith(".safetensors")]
+    for ext in (".safetensors", ".bin"):
+        filenames = [x for x in list_repo_files(model_id) if x.endswith(ext)]
+        if filenames:
+            break
+
+    if not filenames:
+        raise RuntimeError(f"No weights found for {model_id=}")
+
     state_dict = dict()
     for filename in filenames:
         filepath = hf_hub_download(model_id, filename)
-        with safetensors.safe_open(filepath, framework="pt") as f:
-            for k in f.keys():
-                state_dict[_rename_hf_key(k)] = f.get_tensor(k)
+        if filepath.endswith(".safetensors"):
+            with safetensors.safe_open(filepath, framework="pt") as f:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+        else:
+            state_dict.update(torch.load(filepath, map_location="cpu", weights_only=True, mmap=True))
+    state_dict = {_rename_hf_key(k): v for k, v in state_dict.items()}
     return state_dict
