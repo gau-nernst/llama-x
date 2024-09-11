@@ -169,11 +169,10 @@ if __name__ == "__main__":
     if args.profile:
         args.n_steps = 10
 
-    model = Llama.from_hf(
-        args.model,
-        max_seq_len=args.max_seq_len * (args.batch_size if args.document_mask else 1),
-        activation_checkpointing=args.activation_checkpointing,
-    ).bfloat16()
+    model_max_seq_len = args.max_seq_len * (args.batch_size if args.document_mask else 1)
+    model = Llama.from_hf(args.model, max_seq_len=model_max_seq_len)
+    if args.activation_checkpointing:
+        model.enable_activation_checkpointing()
     freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)

@@ -163,11 +163,9 @@ if __name__ == "__main__":
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model = LlamaAudio.from_hf(
-        args.model,
-        max_seq_len=4096,
-        activation_checkpointing=args.activation_checkpointing,
-    )
+    model = LlamaAudio.from_hf(args.model, max_seq_len=4096)
+    if args.activation_checkpointing:
+        model.enable_activation_checkpointing()
     freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)

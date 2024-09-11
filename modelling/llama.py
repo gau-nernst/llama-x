@@ -3,6 +3,7 @@
 # https://github.com/pytorch-labs/gpt-fast/blob/main/model.py
 
 import json
+from functools import partial
 from typing import NamedTuple
 
 import safetensors
@@ -10,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, list_repo_files
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -26,7 +27,6 @@ class LlamaConfig(NamedTuple):
     attn_dropout: float = 0.0
     rope_base: int = 50_000
     is_llama3_1: bool = False
-    activation_checkpointing: bool = False
 
 
 def scale_llama3_1_rope(freqs: torch.Tensor):
@@ -112,7 +112,7 @@ class Attention(nn.Module):
         *,
         mask: Tensor | None = None,
         input_pos: Tensor | None = None,
-        block_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> Tensor:
         B, L, _ = x.shape
         q = self.wq(x).view(B, L, self.num_heads, self.head_dim)
@@ -127,9 +127,7 @@ class Attention(nn.Module):
             k, v = self.kv_cache.update(input_pos, k, v)
 
         if block_mask is not None:
-            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            out = flex_attention(q, k, v, block_mask=block_mask)
+            out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
 
         else:
             is_causal = self.kv_cache is None and mask is None
@@ -167,7 +165,7 @@ class TransformerLayer(nn.Module):
         *,
         mask: Tensor | None = None,
         input_pos: Tensor | None = None,
-        block_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> Tensor:
         x = x + self.attention(self.attention_norm(x), rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
         x = x + self.feed_forward(self.ffn_norm(x))
@@ -198,7 +196,7 @@ class Llama(nn.Module):
         x: Tensor,
         *,
         input_pos: Tensor | None = None,
-        block_mask: Tensor | None = None,
+        block_mask: BlockMask | None = None,
         labels: Tensor | None = None,
     ) -> Tensor:
         # this is used for inference i.e. generate
@@ -206,20 +204,22 @@ class Llama(nn.Module):
         x = self.tok_embeddings(x)
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:
-            if self.config.activation_checkpointing:
-                x = checkpoint(
-                    layer, x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask, use_reentrant=False
-                )
-            else:
-                x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
+            x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
 
         x = self.output(self.norm(x))
         if labels is not None:
             x = F.cross_entropy(x.view(-1, x.shape[-1]).float(), labels.view(-1))
         return x
 
+    def _modules_for_activation_checkpointing(self):
+        return list(self.layers)
+
+    def enable_activation_checkpointing(self):
+        for m in self._modules_for_activation_checkpointing():
+            m.forward = partial(checkpoint, m.forward, use_reentrant=False)
+
     @staticmethod
-    def from_hf(model_id: str, **kwargs):
+    def from_hf(model_id: str, *, dtype: torch.dtype = torch.bfloat16, **kwargs):
         config = _get_hf_config(model_id)
         config = config._replace(**kwargs)
         with torch.device("meta"):
@@ -227,7 +227,8 @@ class Llama(nn.Module):
 
         # we cannot build cache under meta device context. thus, build cache after loading weights
         model.load_state_dict(_get_hf_state_dict(model_id), assign=True)
-        model.build_cache()
+        model.to(dtype)  # convert params to desired dtype
+        model.build_cache()  # buffers from .build_cache() might have different dtype
         return model
 
 

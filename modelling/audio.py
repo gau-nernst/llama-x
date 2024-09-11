@@ -3,7 +3,7 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+from torch.nn.attention.flex_attention import BlockMask
 from torchaudio.transforms import MelSpectrogram
 
 from .llama import Llama, LlamaConfig, _get_hf_config, _get_hf_state_dict
@@ -23,6 +23,8 @@ class LlamaAudio(Llama):
         self.audio_config = audio_config
 
         # inspired by Whisper encoder
+        # 1s of 16 kHz audio corresponds to 100 samples after melspectrogram
+        # after audio_embed, it corresponds to 50 embeddings
         self.audio_embed = nn.Sequential(
             nn.Conv1d(audio_config.n_mels, config.embed_dim, 3, 1, 1),
             nn.GELU(),
@@ -42,32 +44,26 @@ class LlamaAudio(Llama):
         *,
         input_pos: Tensor | None = None,
         labels: Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> Tensor:
         # this is used for inference i.e. generate
+        # NOTE: this is wrong for prefixLM
         mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
 
         x = self.tok_embeddings(tokens)
 
         if audio is not None:
+            # NOTE: melspectrogram is always done in FP32
             # we need to slice the last time step to make it a nice multiple
-            audio = self.melspec(audio)[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
+            audio = self.melspec(audio.float())[..., :-1].clip(1e-12).log10()  # (B, n_mels, L)
             audio = audio - audio.mean(2, keepdim=True)  # cmn
-            audio = audio.to(dtype=self.tok_embeddings.weight.dtype)
-            if self.config.activation_checkpointing:
-                audio = checkpoint(self.audio_embed, audio, use_reentrant=False)
-            else:
-                audio = self.audio_embed(audio)
-            audio = audio.transpose(1, 2)
 
-            # prefix audio
-            x = torch.cat([audio, x], dim=1)
+            audio = self.audio_embed(audio.to(dtype=x.dtype)).transpose(1, 2)
+            x = torch.cat([audio, x], dim=1)  # prefix audio
 
         rope = self.rope[: x.shape[1]]
         for layer in self.layers:
-            if self.config.activation_checkpointing:
-                x = checkpoint(layer, x, rope, mask=mask, input_pos=input_pos, use_reentrant=False)
-            else:
-                x = layer(x, rope, mask=mask, input_pos=input_pos)
+            x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
 
         if audio is not None:
             x = x[:, audio.shape[1] :]  # remove audio embs
@@ -76,8 +72,11 @@ class LlamaAudio(Llama):
             x = F.cross_entropy(x.view(-1, x.shape[-1]).float(), labels.view(-1))
         return x
 
+    def _modules_for_activation_checkpointing(self):
+        return super()._modules_for_activation_checkpointing() + [self.audio_embed]
+
     @staticmethod
-    def from_hf(model_id: str, **kwargs):
+    def from_hf(model_id: str, *, dtype: torch.dtype = torch.bfloat16, **kwargs):
         audio_kwargs = {k: kwargs.pop(k) for k in kwargs if k in AudioConfig._fields}
         audio_config = AudioConfig(**audio_kwargs)
         config = _get_hf_config(model_id)
@@ -95,7 +94,8 @@ class LlamaAudio(Llama):
         for m in model.audio_embed.modules():
             if isinstance(m, nn.Conv1d):
                 m.reset_parameters()
+        model.to(dtype)  # convert params to desired dtype
 
         # we cannot build cache under meta device context. thus, build cache after loading weights
-        model.build_cache()
+        model.build_cache()  # buffers from .build_cache() might have different dtype
         return model
