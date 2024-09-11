@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import wandb
 from datasets import load_dataset, load_from_disk
 from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask
 from torchao.prototype import low_bit_optim
 from tqdm import tqdm
 
@@ -26,33 +27,70 @@ def next_multiple(x: int, n: int) -> int:
     return (x + n - 1) // n * n
 
 
-def _data_iter(tokens_list: list[Tensor], prefix_length_list: list[int], batch_size: int, seq_len_multiple: int = 256):
+def _data_iter_padding(tokens_list: list[Tensor], batch_size: int, seq_len_multiple: int = 256):
     n = len(tokens_list)
 
     while True:
         # shuffle
         indices = torch.randperm(n)
         tokens_list = [tokens_list[idx] for idx in indices]
-        prefix_length_list = prefix_length_list[indices]
 
         for i in range(0, n - batch_size + 1, batch_size):
             tokens_batch = tokens_list[i : i + batch_size]
-            prefix_length_batch = prefix_length_list[i : i + batch_size]
             max_length = max(next_multiple(x.shape[0] - 1, seq_len_multiple) for x in tokens_batch)
 
             inputs = torch.zeros(batch_size, max_length, dtype=torch.int64)
             labels = torch.full((batch_size, max_length), -100, dtype=torch.int64)
-            lengths = torch.empty(batch_size, dtype=torch.int64)
             for _i, tokens in enumerate(tokens_batch):
                 n_toks = tokens.shape[0] - 1
                 inputs[_i, :n_toks] = tokens[:-1]
                 labels[_i, :n_toks] = tokens[1:]
-                lengths[_i] = n_toks
 
-            yield inputs.cuda(), labels.cuda(), lengths, prefix_length_batch.cuda()
+            yield inputs.cuda(), labels.cuda(), None
 
 
-def get_metamathqa(tokenizer_name: str, batch_size: int, max_seq_len: int, seq_len_multiple: int = 256):
+def _data_iter_document_mask(tokens_list: list[Tensor], seq_len: int):
+    inputs = torch.zeros(seq_len, dtype=torch.int64)
+    labels = torch.full((seq_len,), -100, dtype=torch.int64)
+    doc_ids = torch.zeros(seq_len, dtype=torch.int64)
+    i = 0
+    doc_idx = 0
+
+    while True:
+        # shuffle
+        indices = torch.randperm(len(tokens_list))
+        tokens_list = [tokens_list[idx] for idx in indices]
+
+        for tokens in tokens_list:
+            if i + len(tokens) - 1 > seq_len:
+                doc_ids = doc_ids.cuda()
+
+                def mask_mod(b, h, q_idx, kv_idx):
+                    return (doc_ids[q_idx] == doc_ids[kv_idx]) & (q_idx >= kv_idx)
+
+                block_mask = create_block_mask(mask_mod, 1, None, seq_len, seq_len, _compile=True)
+                yield inputs.view(1, -1).cuda(), labels.view(1, -1).cuda(), block_mask
+
+                inputs = torch.zeros(seq_len, dtype=torch.int64)
+                labels = torch.full((seq_len,), -100, dtype=torch.int64)
+                doc_ids = torch.zeros(seq_len, dtype=torch.int64)
+                i = 0
+
+            l = len(tokens) - 1
+            inputs[i : i + l] = tokens[:-1]
+            labels[i : i + l] = tokens[1:]
+            doc_ids[i : i + l] = doc_idx
+            i += l
+            doc_idx += 1
+
+
+def get_metamathqa(
+    tokenizer_name: str,
+    document_mask: bool,
+    batch_size: int,
+    max_seq_len: int,
+    seq_len_multiple: int = 256,
+):
     # sequence length stats
     #
     # tokenizer | max  | P99.9 | P99
@@ -77,16 +115,17 @@ def get_metamathqa(tokenizer_name: str, batch_size: int, max_seq_len: int, seq_l
             answer = " {response}".format(response=example["response"])
             prompt_tokens = tokenizer(prompt, add_bos=True)
             answer_tokens = tokenizer(answer, add_eos=True)
-            return dict(
-                input_ids=(prompt_tokens + answer_tokens)[: max_seq_len + 1],
-                prefix_length=len(prompt_tokens),
-            )
+            return dict(input_ids=(prompt_tokens + answer_tokens)[: max_seq_len + 1])
 
         ds = load_dataset("meta-math/MetaMathQA", split="train").with_format("torch")
         ds = ds.map(apply_template, remove_columns=ds.features)
         ds.save_to_disk(ds_path)
 
-    return _data_iter(ds["input_ids"], ds["prefix_length"], batch_size, seq_len_multiple), len(ds)
+    if document_mask:
+        data_iter = _data_iter_document_mask(ds["input_ids"], batch_size * max_seq_len)
+    else:
+        data_iter = _data_iter_padding(ds["input_ids"], batch_size, seq_len_multiple)
+    return data_iter, len(ds)
 
 
 if __name__ == "__main__":
@@ -102,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
 
+    parser.add_argument("--document_mask", action="store_true")
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--seq_len_multiple", type=int, default=256)
 
@@ -133,7 +173,7 @@ if __name__ == "__main__":
 
     model = Llama.from_hf(
         args.model,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=args.max_seq_len * (args.batch_size if args.document_mask else 1),
         activation_checkpointing=args.activation_checkpointing,
     ).bfloat16()
     freeze_params(model, args.freeze_prefixes)
@@ -157,12 +197,12 @@ if __name__ == "__main__":
 
     train_data_iter, train_size = get_metamathqa(
         args.tokenizer,
+        args.document_mask,
         args.batch_size // args.gradient_accumulation,
         args.max_seq_len,
         seq_len_multiple=args.seq_len_multiple,
     )
     print(f"Training dataset size: {train_size:,}")
-    print(f"Each epoch will takes {train_size // args.batch_size:,} iters to finish")
 
     args.save_dir = Path("runs/metamathqa") / f"{args.run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     args.save_dir.mkdir(parents=True, exist_ok=True)
@@ -183,16 +223,16 @@ if __name__ == "__main__":
 
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
-            inputs, labels, lengths, prefix_lengths = next(train_data_iter)
+            inputs, labels, block_mask = next(train_data_iter)
             # do a train step with longest seq_len to reserve enough memory + avoid memory fragmentation
-            if step == 0:
+            if not args.document_mask and step == 0:
                 pad = args.max_seq_len - inputs.shape[1]
                 inputs = F.pad(inputs, (0, pad))
                 labels = F.pad(labels, (0, pad), value=-100)
 
-            loss = model(inputs, labels=labels)
+            loss = model(inputs, labels=labels, block_mask=block_mask)
             (loss / args.gradient_accumulation).backward()
-            n_toks += lengths.sum()
+            n_toks += (labels != -100).sum()
 
         lr = lr_schedule.get_lr(step)
         for param_group in optim.param_groups:
