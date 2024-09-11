@@ -101,7 +101,7 @@ class LibriSpeech(IterableDataset):
                 audio_batch = pad_to_multiple(audio_batch, self.audio_len_multiple)
                 tokens_batch = pad_to_multiple(tokens_batch, self.text_len_multiple)
                 labels_batch = pad_to_multiple(labels_batch, self.text_len_multiple, fill_value=-100)
-                yield audio_batch, tokens_batch, labels_batch, duration, n_toks
+                yield audio_batch, tokens_batch, labels_batch, duration, n_toks, epoch_idx
 
             epoch_idx += 1
 
@@ -186,16 +186,17 @@ if __name__ == "__main__":
     log_interval = 50
     pbar = tqdm(initial=step, total=args.n_steps, dynamic_ncols=True)
     model.train()
-    n_toks = 0
-    audio_secs = 0
+    n_toks = audio_secs = 0
+    audio_hrs_seen = 0
     time0 = time.perf_counter()
 
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
-            audio, tokens, labels, audio_secs_batch, n_toks_batch = next(dloader)
+            audio, tokens, labels, audio_secs_batch, n_toks_batch, epoch_idx = next(dloader)
             loss = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
             (loss / args.gradient_accumulation).backward()
             audio_secs += audio_secs_batch
+            audio_hrs_seen += audio_secs_batch / 3600
             n_toks += n_toks_batch
 
         lr_schedule.set_lr(optim, step)
@@ -206,20 +207,20 @@ if __name__ == "__main__":
             grad_norm = None
 
         if step % log_interval == 0:
+            time1 = time.perf_counter()
             log_dict = dict(
                 loss=loss.item(),
                 grad_norm=get_grad_norm(model) if grad_norm is None else grad_norm,
                 lr=optim.param_groups[0]["lr"],
                 max_memory_allocated=torch.cuda.max_memory_allocated() / 1e9,
                 max_memory_reserved=torch.cuda.max_memory_reserved() / 1e9,
+                audio_hrs_seen=audio_hrs_seen,
+                toks_per_second=n_toks / (time1 - time0),
+                audio_secs_per_second=audio_secs / (time1 - time0),
+                epoch=epoch_idx,
             )
-            if step > 0:
-                time1 = time.perf_counter()
-                log_dict["toks_per_second"] = n_toks / (time1 - time0)
-                log_dict["audio_secs_per_second"] = audio_secs / (time1 - time0)
-                n_toks = 0
-                audio_secs = 0
-                time0 = time1
+            n_toks = audio_secs = 0
+            time0 = time1
             run.log(log_dict, step=step)
             pbar.set_postfix(loss=log_dict["loss"])
 
