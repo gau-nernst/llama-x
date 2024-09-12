@@ -148,9 +148,9 @@ if __name__ == "__main__":
     model = LlamaAudio.from_hf(args.model, max_seq_len=4096)
     if args.activation_checkpointing:
         model.enable_activation_checkpointing()
-    freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
+    freeze_params(model, args.freeze_prefixes)
     # TODO: handle quantization/LoRA for LM head separately
     if args.compile:
         model.compile()
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     while step < args.n_steps:
         for _ in range(args.gradient_accumulation):
             audio, tokens, labels, audio_secs_batch, n_toks_batch, epoch_idx = next(dloader)
-            loss = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
+            loss, text_norm, audio_norm = model(audio.cuda(), tokens.cuda(), labels=labels.cuda())
             (loss / args.gradient_accumulation).backward()
             audio_secs += audio_secs_batch
             audio_hrs_seen += audio_secs_batch / 3600
@@ -210,7 +210,10 @@ if __name__ == "__main__":
             log_dict = dict(
                 epoch=epoch_idx,
                 loss=loss.item(),
+                text_norm=text_norm.item(),
+                audio_norm=audio_norm.item(),
                 grad_norm=get_grad_norm(model) if grad_norm is None else grad_norm,
+                audio_embed_grad_norm=get_grad_norm(model.audio_embed),
                 lr=optim.param_groups[0]["lr"],
                 max_memory_allocated=torch.cuda.max_memory_allocated() / 1e9,
                 max_memory_reserved=torch.cuda.max_memory_reserved() / 1e9,

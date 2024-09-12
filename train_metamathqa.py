@@ -173,9 +173,9 @@ if __name__ == "__main__":
     model = Llama.from_hf(args.model, max_seq_len=model_max_seq_len)
     if args.activation_checkpointing:
         model.enable_activation_checkpointing()
-    freeze_params(model, args.freeze_prefixes)
     quantize_linear_(model.layers, args.quantize, **args.quantize_kwargs)
     apply_linear_adapter_(model.layers, args.adapter, **args.adapter_kwargs)
+    freeze_params(model, args.freeze_prefixes)
     # TODO: handle quantization/LoRA for LM head separately
     if args.compile:
         model.compile()

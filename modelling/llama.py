@@ -200,9 +200,14 @@ class Llama(nn.Module):
         labels: Tensor | None = None,
     ) -> Tensor:
         # this is used for inference i.e. generate
-        mask = self.causal_mask[None, None, input_pos] if input_pos is not None else None
+        if input_pos is not None:
+            mask = self.causal_mask[None, None, input_pos]
+            rope = self.rope[input_pos]
+        else:
+            mask = None
+            rope = self.rope[: x.shape[1]]
+
         x = self.tok_embeddings(x)
-        rope = self.rope[: x.shape[1]]
         for layer in self.layers:
             x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
 
