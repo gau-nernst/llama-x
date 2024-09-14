@@ -116,7 +116,8 @@ class LlamaAudio(Llama):
         with torch.device("meta"):
             model = LlamaAudio(config, audio_config).eval()
 
-        incompat_keys = model.load_state_dict(_get_hf_state_dict(model_id), strict=False, assign=True)
+        state_dict = _get_hf_state_dict(model_id, config)
+        incompat_keys = model.load_state_dict(state_dict, strict=False, assign=True)
         if incompat_keys:
             print(incompat_keys)
 

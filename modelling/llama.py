@@ -15,6 +15,8 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
+# default values for vocab_size and rope_base are for Llama2
+# so that we can load Llama2 models from HF correctly.
 class LlamaConfig(NamedTuple):
     embed_dim: int
     num_layers: int
@@ -23,9 +25,9 @@ class LlamaConfig(NamedTuple):
     num_kv_heads: int
     intermediate_dim: int
     max_seq_len: int = 2048
-    vocab_size: int = 128_256  # Llama3
+    vocab_size: int = 32_000
     attn_dropout: float = 0.0
-    rope_base: int = 50_000
+    rope_base: int = 10_000
     is_llama3_1: bool = False
 
 
@@ -225,7 +227,8 @@ class Llama(nn.Module):
             model = Llama(config).eval()
 
         # we cannot build cache under meta device context. thus, build cache after loading weights
-        model.load_state_dict(_get_hf_state_dict(model_id), assign=True)
+        state_dict = _get_hf_state_dict(model_id, config)
+        model.load_state_dict(state_dict, assign=True)
         model.to(dtype)  # convert params to desired dtype
         model.build_cache()  # buffers from .build_cache() might have different dtype
         return model
@@ -270,7 +273,7 @@ def _rename_hf_key(key: str):
     )
 
 
-def _get_hf_state_dict(model_id: str):
+def _get_hf_state_dict(model_id: str, config: LlamaConfig):
     for ext in (".safetensors", ".bin"):
         filenames = [x for x in list_repo_files(model_id) if x.endswith(ext)]
         if filenames:
@@ -289,4 +292,11 @@ def _get_hf_state_dict(model_id: str):
         else:
             state_dict.update(torch.load(filepath, map_location="cpu", weights_only=True, mmap=True))
     state_dict = {_rename_hf_key(k): v for k, v in state_dict.items()}
+
+    # RoPE logic in HF is different from meta's. need to transpose projection weight to make it correct.
+    for k, v in state_dict.items():
+        if k.endswith((".wq.weight", ".wk.weight")):
+            new_v = v.view(-1, 2, config.head_dim // 2, config.embed_dim).transpose(1, 2).flatten(0, -2)
+            v.copy_(new_v)
+
     return state_dict
