@@ -3,7 +3,7 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from torchaudio.transforms import MelSpectrogram
 
 from .llama import Llama, LlamaConfig, _get_hf_config, _get_hf_state_dict
@@ -17,6 +17,8 @@ class AudioConfig(NamedTuple):
     n_mels: int = 128
 
 
+# NOTE:
+# - Qwen-Audio: Whisper encoder + stride-2 avg-pool. layernorm (from Whisper encoder)
 # inspired by Whisper encoder
 # 1s of 16 kHz audio corresponds to 100 samples after melspectrogram
 # after audio_embed, it corresponds to 50 embeddings
@@ -25,11 +27,17 @@ class SimpleAudioEmbed(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.Sequential(
-            nn.Conv1d(config.n_mels, embed_dim, 3, 1, 1),
+            nn.Conv1d(config.n_mels, embed_dim, 3, 3, 1),
             nn.GELU(),
             nn.Conv1d(embed_dim, embed_dim, 3, 2, 1),
             nn.GELU(),
         )
+
+    def reset_parameters(self):
+        for m in self.layers:
+            if isinstance(m, nn.Conv1d):
+                nn.init.trunc_normal_(m.weight, 0, 0.01 * (1024 / m.out_channels) ** 0.5)
+                nn.init.zeros_(m.bias)
 
     def build_cache(self):
         self.melspec = MelSpectrogram(**self.config._asdict(), norm="slaney", mel_scale="slaney")
@@ -42,7 +50,8 @@ class SimpleAudioEmbed(nn.Module):
         audio = (audio + 4) / 4  # magic from whisper. normalize to roughly [-1, 1]
 
         audio = audio.to(dtype=self.layers[0].weight.dtype)
-        return self.layers(audio).transpose(1, 2)
+        audio = self.layers(audio).transpose(1, 2)
+        return audio
 
 
 class LlamaAudio(Llama):
@@ -54,6 +63,13 @@ class LlamaAudio(Llama):
     def build_cache(self, inference: bool = False):
         super().build_cache(inference)
         self.audio_embed.build_cache()
+
+    @torch.compiler.disable
+    def _create_prefix_mask(self, prefix_len: int, L: int):
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx <= q_idx.clip(prefix_len)
+
+        return create_block_mask(mask_mod, None, None, L, L)
 
     def forward(
         self,
@@ -71,6 +87,7 @@ class LlamaAudio(Llama):
             audio = self.audio_embed(audio)
             audio_norm = audio.norm(p=2, dim=-1).mean()
             x = torch.cat([audio, x], dim=1)  # prefix audio
+            block_mask = self._create_prefix_mask(audio.shape[1], x.shape[1])
 
         # this is used for inference i.e. generate
         if input_pos is not None:
@@ -105,12 +122,7 @@ class LlamaAudio(Llama):
 
         # these weights don't exist in state_dict. must manually initialize them from meta device.
         model.audio_embed.to_empty(device="cpu")
-        model.audio_embed.to(dtype=model.tok_embeddings.weight.dtype)
-        for m in model.audio_embed.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.trunc_normal_(m.weight, 0, 0.02 * (1024 / config.embed_dim) ** 0.5)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        model.audio_embed.reset_parameters()
         model.to(dtype)  # convert params to desired dtype
 
         # we cannot build cache under meta device context. thus, build cache after loading weights

@@ -110,8 +110,8 @@ class Attention(nn.Module):
         x: Tensor,
         rope: Tensor,
         *,
-        mask: Tensor | None = None,
         input_pos: Tensor | None = None,
+        mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
     ) -> Tensor:
         B, L, _ = x.shape
@@ -124,14 +124,14 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
 
         if self.kv_cache is not None:
+            assert input_pos is not None
             k, v = self.kv_cache.update(input_pos, k, v)
 
         if block_mask is not None:
             out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-
         else:
-            is_causal = self.kv_cache is None and mask is None
             dropout = self.attn_dropout if self.training else 0.0
+            is_causal = mask is None
             out = F.scaled_dot_product_attention(q, k, v, mask, dropout, is_causal, enable_gqa=True)
 
         out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
@@ -163,11 +163,11 @@ class TransformerLayer(nn.Module):
         x: Tensor,
         rope: Tensor,
         *,
-        mask: Tensor | None = None,
         input_pos: Tensor | None = None,
+        mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
     ) -> Tensor:
-        x = x + self.attention(self.attention_norm(x), rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
+        x = x + self.attention(self.attention_norm(x), rope, input_pos=input_pos, mask=mask, block_mask=block_mask)
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
 
@@ -183,33 +183,27 @@ class Llama(nn.Module):
 
     def build_cache(self, inference: bool = False):
         self.register_buffer("rope", build_rope(self.config), persistent=False)
-
         if inference:
             for layer in self.layers:
                 layer.attention.kv_cache = KVCache(1, self.config, self.tok_embeddings.weight.dtype)
-
-            L = self.config.max_seq_len
-            self.register_buffer("causal_mask", torch.tril(torch.ones(L, L, dtype=torch.bool)), persistent=False)
 
     def forward(
         self,
         x: Tensor,
         *,
         input_pos: Tensor | None = None,
+        mask: Tensor | None = None,
         block_mask: BlockMask | None = None,
         labels: Tensor | None = None,
     ) -> Tensor:
-        # this is used for inference i.e. generate
         if input_pos is not None:
-            mask = self.causal_mask[None, None, input_pos]
             rope = self.rope[input_pos]
         else:
-            mask = None
             rope = self.rope[: x.shape[1]]
 
         x = self.tok_embeddings(x)
         for layer in self.layers:
-            x = layer(x, rope, mask=mask, input_pos=input_pos, block_mask=block_mask)
+            x = layer(x, rope, input_pos=input_pos, mask=mask, block_mask=block_mask)
 
         x = self.output(self.norm(x))
         if labels is not None:
